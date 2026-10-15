@@ -126,9 +126,9 @@ echo "mine" >"$B/agents/spike.md"
 echo '{"mcpServers":{"other":{"command":"x"}}}' >"$B/mcp.json"
 ln -s /nonexistent "$B/plugins/chronos"
 before="$(tree_hash "$B")"
-out="$(oc install --dry-run --force 2>&1)"; rc=$?
-check "exit 0 with --force" test "$rc" = 0
-check "tree unchanged (dry-run --force)" test "$before" = "$(tree_hash "$B")"
+out="$(oc install --dry-run --replace-foreign 2>&1)"; rc=$?
+check "exit 0 with --replace-foreign" test "$rc" = 0
+check "tree unchanged (dry-run --replace-foreign)" test "$before" = "$(tree_hash "$B")"
 check "reports move-aside" grep -q "\[dry-run\] mv $B/agents/spike.md" <<<"$out"
 before="$(tree_hash "$FRESH_B")"
 out="$(SYNAPS_BASE_DIR="$FRESH_B" HOME="$FRESH_HOME" "$OC" update --dry-run 2>&1)"
@@ -149,17 +149,31 @@ check "reported as skipped" grep -q "chronos: skipped, .* (symlink → $target)"
 check "no plugins.json entry for chronos" jq -e 'all(.installed[]; .name != "chronos")' "$B/plugins.json"
 check "other plugins installed" jq -e '[.installed[].name] == ["agent-comms","synaps-dash"]' "$B/plugins.json"
 check "status says foreign" grep -q "chronos: skipped (foreign) symlink" <<<"$(oc status)"
-out="$(oc install --force 2>&1)"; rc=$?
-check "--force exit 0" test "$rc" = 0
+out="$(oc install --reclone 2>&1)"; rc=$?
+check "--reclone exit 0" test "$rc" = 0
+check "--reclone leaves the plugin symlink alone" test "$(readlink "$B/plugins/chronos")" = "$target"
+check "--reclone leaves the agent symlink alone" test "$(readlink "$B/agents/zero.md")" = "$target/.synaps-plugin/plugin.json"
+# swap our mcp entry for a user-owned one, then replace foreign items explicitly
+jq '.mcpServers["context-mode"] = {"command":"node","args":["/elsewhere/server.bundle.mjs"]}' "$B/mcp.json" >"$B/mcp.json.new" && mv "$B/mcp.json.new" "$B/mcp.json"
+out="$(oc install --replace-foreign 2>&1)"; rc=$?
+check "--replace-foreign exit 0" test "$rc" = 0
 bk="$(ls -d "$B"/overclocked/backups/*/plugins/chronos 2>/dev/null | head -n1)"
-check "--force moved symlink into backups/" test "$(readlink "$bk")" = "$target"
+check "--replace-foreign moved symlink into backups/" test "$(readlink "$bk")" = "$target"
 check "nothing but plugins left in plugins/" test "$(ls "$B/plugins" | tr '\n' ' ')" = "agent-comms chronos synaps-dash "
-check "--force cloned chronos" test -d "$B/plugins/chronos/.git"
-check "--force recorded chronos" jq -e 'any(.installed[]; .name == "chronos")' "$B/plugins.json"
-check "--force backed up plugins.json" bash -c "ls '$B'/overclocked/backups/*/plugins.json >/dev/null"
-check "--force moved agent aside" test -L "$(ls -d "$B"/overclocked/backups/*/agents/zero.md | head -n1)"
+check "--replace-foreign cloned chronos" test -d "$B/plugins/chronos/.git"
+check "--replace-foreign recorded chronos" jq -e 'any(.installed[]; .name == "chronos")' "$B/plugins.json"
+check "--replace-foreign backed up plugins.json" bash -c "ls '$B'/overclocked/backups/*/plugins.json >/dev/null"
+check "--replace-foreign moved agent aside" test -L "$(ls -d "$B"/overclocked/backups/*/agents/zero.md | head -n1)"
+check "displacements recorded" jq -e --arg p "$B/plugins/chronos" --arg t "$target" 'any(.displaced[]; .path == $p and .link == $t) and any(.displaced[]; .entry.args == ["/elsewhere/server.bundle.mjs"])' "$B/overclocked/state.json"
+check "our mcp entry now active" jq -e --arg b "$B" '.mcpServers["context-mode"].args[0] == "\($b)/overclocked/context-mode/server.bundle.mjs"' "$B/mcp.json"
 check "no backups in scanned trees" bash -c "! ls '$B/plugins' '$B/skills' '$B/agents' | grep -q bak"
 check "target dir intact" test -f "$target/.synaps-plugin/plugin.json"
+out="$(oc uninstall 2>&1)"; rc=$?
+check "uninstall exit 0" test "$rc" = 0
+check "uninstall restores the plugin symlink, same target" test "$(readlink "$B/plugins/chronos")" = "$target"
+check "uninstall restores the agent symlink" test "$(readlink "$B/agents/zero.md")" = "$target/.synaps-plugin/plugin.json"
+check "only the restored symlink left in plugins/" test "$(ls -A "$B/plugins" | tr '\n' ' ')" = "chronos "
+check "uninstall restores the user's mcp entry" jq -e '.mcpServers["context-mode"].args == ["/elsewhere/server.bundle.mjs"]' "$B/mcp.json"
 
 # ======================================================================
 start "pre-existing mcp.json with another server is preserved"
@@ -176,7 +190,7 @@ check "unknown top-level key preserved" jq -e '.keepMe == {"x":1}' "$B/mcp.json"
 check "context-mode added" jq -e '.mcpServers["context-mode"].command == "node"' "$B/mcp.json"
 bk="$(ls "$B"/overclocked/backups/*/mcp.json 2>/dev/null | head -n1)"
 check "timestamped backup equals original" test "$(cat "$bk")" = "$orig"
-# a foreign context-mode entry is left alone without --force
+# a foreign context-mode entry is left alone without --replace-foreign
 new_home; mkdir -p "$B"
 echo '{"mcpServers":{"context-mode":{"command":"node","args":["/elsewhere/server.bundle.mjs"]}}}' >"$B/mcp.json"
 mkdir -p "$B/plugins" "$B/agents" "$B/skills"
@@ -283,23 +297,25 @@ check "other plugins untouched" grep -q "agent-comms: up to date" <<<"$out"
 check "plugins.json still schema-shaped" plugins_json_shape "$B/plugins.json"
 
 # ======================================================================
-start "force-pushed upstream: update fails loudly, update --force recovers"
+start "force-pushed upstream: update fails loudly, update --reclone recovers"
 force_rewrite chronos
 before="$(git -C "$B/plugins/chronos" rev-parse HEAD)"
 out="$(ocf update 2>&1)"; rc=$?
 check "update still exits 0" test "$rc" = 0
 check "git error shown, not swallowed" grep -q "unrelated histories" <<<"$out"
-check "hint at --force" grep -q "update --force" <<<"$out"
+check "hint at --reclone" grep -q "update --reclone" <<<"$out"
 check "plugin left as it was" test "$(git -C "$B/plugins/chronos" rev-parse HEAD)" = "$before"
-out="$(ocf update --force 2>&1)"; rc=$?
-check "update --force exit 0" test "$rc" = 0
+out="$(ocf update --reclone 2>&1)"; rc=$?
+check "update --reclone exit 0" test "$rc" = 0
 check "recloned onto rewritten upstream" test "$(git -C "$B/plugins/chronos" rev-parse HEAD)" = "$(up_head chronos)"
 check "plugins.json commit follows" test "$(pj_commit "$B/plugins.json" chronos)" = "$(up_head chronos)"
 check "old copy in backups/" test "$(git -C "$(ls -d "$B"/overclocked/backups/*/plugins/chronos | head -n1)" rev-parse HEAD)" = "$before"
 check "plugins/ holds only live plugins" test "$(ls -A "$B/plugins" | tr '\n' ' ')" = "agent-comms chronos synaps-dash "
+n_bk="$(ls -d "$B"/overclocked/backups/*/plugins/chronos* | wc -l)"
 out="$(ocf install --force 2>&1)"; rc=$?
-check "install --force reclones owned plugins" test "$(git -C "$B/plugins/chronos" rev-parse HEAD)" = "$(up_head chronos)"
-check "install --force leaves only live plugins" test "$(ls -A "$B/plugins" | tr '\n' ' ')" = "agent-comms chronos synaps-dash "
+check "--force prints a deprecation notice" grep -q "force is deprecated; it now means --reclone" <<<"$out"
+check "--force (= --reclone) reclones owned plugins" test "$(ls -d "$B"/overclocked/backups/*/plugins/chronos* | wc -l)" -gt "$n_bk"
+check "--force leaves only live plugins" test "$(ls -A "$B/plugins" | tr '\n' ' ')" = "agent-comms chronos synaps-dash "
 
 # ======================================================================
 start "orphaned clone is adopted"
@@ -340,6 +356,93 @@ check "--profile without a value dies" test "$rc" != 0
 check "--profile message" grep -q "needs a profile name" <<<"$out"
 
 # ======================================================================
+start "--reclone never touches foreign symlinks (offline)"
+offline_home
+tgt="$(tmpd)"; mkdir -p "$B/plugins"; ln -s "$tgt" "$B/plugins/chronos"
+out="$(ocf install --reclone 2>&1)"; rc=$?
+check "exit 0" test "$rc" = 0
+check "symlink untouched" test "$(readlink "$B/plugins/chronos")" = "$tgt"
+check "skill symlinks untouched" test "$(readlink "$B/skills/gauntlet-loop")" = /nonexistent
+out="$(ocf install --force 2>&1)"
+check "--force alias also leaves it" test "$(readlink "$B/plugins/chronos")" = "$tgt"
+check "nothing displaced" jq -e '(.displaced // []) == []' "$B/overclocked/state.json"
+
+# ======================================================================
+start "adoption needs a clean clone"
+offline_home
+mkdir -p "$B/plugins"
+git clone -q "file://$UP/chronos.git" "$B/plugins/chronos"
+echo dirty >>"$B/plugins/chronos/main.py"
+git clone -q "file://$UP/synaps-dash.git" "$B/plugins/synaps-dash"
+echo ahead >>"$B/plugins/synaps-dash/main.py"; git -C "$B/plugins/synaps-dash" commit -qam ahead
+out="$(ocf install 2>&1)"; rc=$?
+check "exit 0" test "$rc" = 0
+check "dirty clone treated as foreign" grep -q "chronos: .* local changes or unpushed commits; treating it as foreign" <<<"$out"
+check "ahead clone treated as foreign" grep -q "synaps-dash: .* local changes or unpushed commits; treating it as foreign" <<<"$out"
+check "neither recorded" jq -e '.items["plugin:chronos"] == null and .items["plugin:synaps-dash"] == null' "$B/overclocked/state.json"
+check "dirty work kept" grep -q dirty "$B/plugins/chronos/main.py"
+
+# ======================================================================
+start "uninstall keeps plugins.json entries it doesn't own (shady repro)"
+offline_home
+ocf install >/dev/null 2>&1
+dev="$(tmpd)"; mv "$B/plugins/agent-comms" "$dev/agent-comms"; ln -s "$dev/agent-comms" "$B/plugins/agent-comms"
+jq '.installed |= map(if .name == "agent-comms" then .marketplace = "local" else . end)' "$B/plugins.json" >"$B/p.new" && mv "$B/p.new" "$B/plugins.json"
+out="$(ocf uninstall 2>&1)"; rc=$?
+check "exit 0" test "$rc" = 0
+check "dev symlink left alone" test "$(readlink "$B/plugins/agent-comms")" = "$dev/agent-comms"
+check "foreign-marketplace entry kept" jq -e 'any(.installed[]; .name == "agent-comms" and .marketplace == "local")' "$B/plugins.json"
+check "our moved entries dropped" jq -e '[.installed[].name] == ["agent-comms"]' "$B/plugins.json"
+check "marketplace overclock added is dropped" jq -e 'all(.marketplaces[]; .name != "synaps-overclocked")' "$B/plugins.json"
+
+# ======================================================================
+start "uninstall keeps a pre-existing marketplace and trusted host"
+offline_home
+cat >"$B/plugins.json" <<'EOF'
+{"marketplaces":[{"name":"synaps-overclocked","url":"https://example.invalid/m.json","cached_plugins":[]}],"installed":[],"trusted_hosts":["github.com/HaseebKhalid1507"]}
+EOF
+chmod 644 "$B/plugins.json"
+orig="$(jq -S . "$B/plugins.json")"
+ocf install >/dev/null 2>&1
+check "existing file mode kept (644)" test "$(stat -c %a "$B/plugins.json")" = 644
+check "not recorded as added" jq -e '(.added_marketplace // false) == false and (.added_trusted_hosts // []) == []' "$B/overclocked/state.json"
+ocf uninstall >/dev/null 2>&1
+check "plugins.json back to the original" test "$(jq -S . "$B/plugins.json")" = "$orig"
+check "mode still 644" test "$(stat -c %a "$B/plugins.json")" = 644
+
+# ======================================================================
+start "new JSON files are 0600"
+offline_home
+ocf install >/dev/null 2>&1
+check "new plugins.json 600" test "$(stat -c %a "$B/plugins.json")" = 600
+check "new state.json 600" test "$(stat -c %a "$B/overclocked/state.json")" = 600
+check "profile recorded" jq -e --arg pj "$B/plugins.json" '.profile == "" and .plugins_json == $pj' "$B/overclocked/state.json"
+
+# ======================================================================
+start "uninstall follows the recorded profile"
+offline_home
+SYNAPS_PROFILE=work ocf install >/dev/null 2>&1
+out="$(ocf uninstall 2>&1)"; rc=$?
+check "exit 0" test "$rc" = 0
+check "warns about the profile mismatch" grep -q "recorded under profile 'work'" <<<"$out"
+check "cleaned the recorded profile's plugins.json" jq -e '.installed == []' "$B/work/plugins.json"
+check "did not create a base plugins.json" test ! -e "$B/plugins.json"
+
+# ======================================================================
+start "paths with .. are refused"
+offline_home
+ocf install >/dev/null 2>&1
+victim="$HOME/victim"; mkdir -p "$victim"; echo keep >"$victim/f"
+jq --arg p "$B/../victim" '.items["plugin:evil"] = {path:$p}' "$B/overclocked/state.json" >"$B/s.new" && mv "$B/s.new" "$B/overclocked/state.json"
+out="$(ocf uninstall 2>&1)"; rc=$?
+check "uninstall exit 0" test "$rc" = 0
+check "warned" grep -q "plugin:evil: recorded path .* \. / \.\. components; left alone" <<<"$out"
+check "victim untouched" test "$(cat "$victim/f")" = keep
+out="$(SYNAPS_BASE_DIR="$HOME/x/../.synaps-cli" "$OC" status 2>&1)"; rc=$?
+check "base dir with .. refused" test "$rc" != 0
+check "message" grep -q "must not contain . or .. components" <<<"$out"
+
+# ======================================================================
 start "bad environments die cleanly"
 out="$(env -u HOME -u SYNAPS_BASE_DIR "$OC" status 2>&1)"; rc=$?
 check "unset HOME: nonzero" test "$rc" != 0
@@ -377,6 +480,7 @@ check "full: plugins/ empty" test -z "$(ls -A "$B/plugins")"
 check "full: skills/ empty" test -z "$(ls -A "$B/skills")"
 check "full: agents/ empty" test -z "$(ls -A "$B/agents")"
 check "full: mcp.json context-mode gone" jq -e '.mcpServers["context-mode"] == null' "$B/mcp.json"
+check "full: trusted host overclock added is gone" jq -e '.trusted_hosts == [] and .marketplaces == []' "$B/plugins.json"
 check "full: context-mode clone moved" test -d "$(ls -d "$B"/overclocked/removed/*/overclocked/context-mode | head -n1)"
 check "full: backups of JSON kept" bash -c "ls '$B'/overclocked/backups/*/mcp.json '$B'/overclocked/backups/*/plugins.json >/dev/null"
 
