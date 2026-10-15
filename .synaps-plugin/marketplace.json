@@ -1,0 +1,32 @@
+{
+  "name": "synaps-overclocked",
+  "version": "1.0.0",
+  "description": "Haseeb's Synaps plugin stack: session awareness, time injection and the browser dashboard.",
+  "trust": {
+    "publisher": "Haseeb Khalid",
+    "homepage": "https://github.com/HaseebKhalid1507/synaps-overclocked"
+  },
+  "plugins": [
+    {
+      "name": "agent-comms",
+      "source": "https://github.com/HaseebKhalid1507/agent-comms.git",
+      "version": "0.1.0",
+      "description": "Session awareness: live sessions see each other (busy/idle, claims) and can message each other.",
+      "license": "MIT"
+    },
+    {
+      "name": "chronos",
+      "source": "https://github.com/HaseebKhalid1507/synaps-chronos.git",
+      "version": "0.1.0",
+      "description": "Injects the current time into LLM context before every user message.",
+      "license": "MIT"
+    },
+    {
+      "name": "synaps-dash",
+      "source": "https://github.com/HaseebKhalid1507/synaps-dash.git",
+      "version": "0.1.0",
+      "description": "Browser client for the synaps session daemon (needs bun).",
+      "license": "MIT"
+    }
+  ]
+}

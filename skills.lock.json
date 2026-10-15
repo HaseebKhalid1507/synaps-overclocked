@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "skills": {
+    "gauntlet-loop": {
+      "repo": "https://github.com/robonuggets/gauntlet-loop.git",
+      "commit": "9b1975a1b8f01981f3f1e6b667ad3aaf907178ea",
+      "subdir": ".claude/skills/gauntlet-loop",
+      "extra_files": ["LICENSE"],
+      "license": "CC-BY-4.0",
+      "source_note": "source: https://github.com/robonuggets/gauntlet-loop @ 9b1975a (CC BY 4.0, technique by Matt Shumer)"
+    },
+    "last30days": {
+      "repo": "https://github.com/mvanhorn/last30days-skill.git",
+      "commit": "0188da7ce7a216978434210eece23d79c48c821b",
+      "subdir": "skills/last30days",
+      "extra_files": ["LICENSE"],
+      "license": "MIT (Copyright (c) 2026 Matt Van Horn)"
+    }
+  },
+  "mcp": {
+    "context-mode": {
+      "repo": "https://github.com/mksglu/context-mode.git",
+      "commit": "928bdf104bca04da977fc6e6095dc3d0328939df",
+      "license": "Elastic-2.0 (ELv2, Copyright 2026 Mert Koseoglu)"
+    }
+  }
+}

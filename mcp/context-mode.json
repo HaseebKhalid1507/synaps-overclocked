@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "context-mode": {
+      "command": "node",
+      "args": ["@CLONE@/server.bundle.mjs"],
+      "env": {
+        "CONTEXT_MODE_DIR": "@BASE@/context-mode",
+        "CLAUDE_CONFIG_DIR": "@BASE@/context-mode-shim"
+      }
+    }
+  }
+}
