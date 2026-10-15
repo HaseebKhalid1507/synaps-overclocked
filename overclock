@@ -1,0 +1,531 @@
+#!/usr/bin/env bash
+# overclock: turn stock SynapsCLI into the synaps-overclocked stack.
+#   overclock [install|status|update] [--dry-run] [--force] [--profile NAME]
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+MARKETPLACE_NAME="synaps-overclocked"
+MARKETPLACE_REPO="https://github.com/HaseebKhalid1507/synaps-overclocked"
+MARKETPLACE_URL="https://raw.githubusercontent.com/HaseebKhalid1507/synaps-overclocked/HEAD/.synaps-plugin/marketplace.json"
+MANIFEST="$SELF_DIR/.synaps-plugin/marketplace.json"
+LOCK="$SELF_DIR/skills.lock.json"
+MCP_TEMPLATE="$SELF_DIR/mcp/context-mode.json"
+
+CMD=install DRY=0 FORCE=0 PROFILE="${SYNAPS_PROFILE:-}"
+
+usage() {
+  cat <<EOF
+usage: overclock [install|status|update] [--dry-run] [--force] [--profile NAME]
+
+  install   (default) install everything that is missing; existing items are skipped
+  status    show each item: installed / skipped (foreign) / missing, commit vs pinned
+  update    fast-forward the plugins; bump skills/context-mode when skills.lock.json changes
+
+  --dry-run  print every action, write nothing
+  --force    replace foreign items (moved aside to <path>.bak-overclock-<ts>, never deleted)
+  --profile  Synaps profile (default: \$SYNAPS_PROFILE)
+
+Base dir: \$SYNAPS_BASE_DIR or ~/.synaps-cli
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    install|status|update) CMD="$1" ;;
+    --dry-run) DRY=1 ;;
+    --force) FORCE=1 ;;
+    --profile) shift; PROFILE="${1:-}" ;;
+    --profile=*) PROFILE="${1#--profile=}" ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "overclock: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+# ---------- output ----------
+if [ -t 1 ]; then C_R=$'\e[31m' C_G=$'\e[32m' C_Y=$'\e[33m' C_B=$'\e[1m' C_0=$'\e[0m'; else C_R='' C_G='' C_Y='' C_B='' C_0=''; fi
+say()  { printf '%s\n' "$*"; }
+head1(){ printf '\n%s== %s ==%s\n' "$C_B" "$*" "$C_0"; }
+ok()   { printf '  %s✓%s %s\n' "$C_G" "$C_0" "$*"; }
+skip() { printf '  %s-%s %s\n' "$C_Y" "$C_0" "$*"; }
+warn() { printf '  %s!%s %s\n' "$C_Y" "$C_0" "$*" >&2; }
+die()  { printf '%soverclock: %s%s\n' "$C_R" "$*" "$C_0" >&2; exit 1; }
+dry()  { printf '  [dry-run] %s\n' "$*"; }
+
+# ---------- guards ----------
+[ "$(id -u)" -eq 0 ] && die "refusing to run as root"
+command -v git >/dev/null 2>&1 || die "git is required"
+command -v jq  >/dev/null 2>&1 || die "jq is required"
+[ -f "$MANIFEST" ] && [ -f "$LOCK" ] && [ -f "$MCP_TEMPLATE" ] || die "run overclock from a synaps-overclocked checkout ($SELF_DIR is incomplete)"
+
+BASE="${SYNAPS_BASE_DIR:-$HOME/.synaps-cli}"
+case "$BASE" in /*) ;; *) die "base dir must be absolute: $BASE" ;; esac
+BASE="${BASE%/}"
+if [ -n "$PROFILE" ]; then
+  case "$PROFILE" in */*|.|..) die "invalid profile name: $PROFILE" ;; esac
+fi
+
+# Path resolution mirrors agent-core config.rs:
+#   plugins.json -> resolve_write_path   (profile dir if a profile is active)
+#   mcp.json     -> resolve_read_path    (profile file if it exists, else base)
+#   skills/      -> resolve_read_path_extended (profile dir if it exists, else base)
+#   plugins/     -> base_dir()/plugins   (extension manager only loads from here)
+#   agents/      -> base_dir()/agents    (tools/agent.rs)
+PDIR="$BASE${PROFILE:+/$PROFILE}"
+PSTATE="$PDIR/plugins.json"
+if [ -n "$PROFILE" ] && [ -e "$PDIR/mcp.json" ]; then MCP_FILE="$PDIR/mcp.json"; else MCP_FILE="$BASE/mcp.json"; fi
+if [ -n "$PROFILE" ] && [ -d "$PDIR/skills" ]; then SKILLS_DIR="$PDIR/skills"; else SKILLS_DIR="$BASE/skills"; fi
+PLUGINS_DIR="$BASE/plugins"
+AGENTS_DIR="$BASE/agents"
+OC_DIR="$BASE/overclocked"
+OC_STATE="$OC_DIR/state.json"
+CM_DIR="$OC_DIR/context-mode"
+TS="$(date +%Y%m%d%H%M%S)"
+NOW="$(date -u +%Y-%m-%dT%H:%M:%S+00:00)"
+
+have() { command -v "$1" >/dev/null 2>&1; }
+in_list() { local x="$1" y; shift; for y in "$@"; do [ "$x" = "$y" ] && return 0; done; return 1; }
+short() { printf '%s' "${1:0:7}"; }
+exists() { [ -e "$1" ] || [ -L "$1" ]; }
+gitq() { GIT_OPTIONAL_LOCKS=0 git -C "$1" "${@:2}"; }
+head_of() { gitq "$1" rev-parse HEAD 2>/dev/null || true; }
+is_dirty() { [ -n "$(gitq "$1" status --porcelain --untracked-files=no 2>/dev/null)" ]; }
+
+# Every JSON write: tmp file in the same dir, then rename.
+write_json() { # <file> <json>
+  local f="$1" tmp
+  mkdir -p "$(dirname "$f")"
+  tmp="$(mktemp "$f.overclock-tmp.XXXXXX")"
+  printf '%s\n' "$2" >"$tmp"
+  mv -f "$tmp" "$f"
+}
+
+backup_file() { # copy (not move) a JSON file before rewriting it
+  local f="$1"
+  [ -f "$f" ] || return 0
+  cp -p "$f" "$f.bak-overclock-$TS"
+  ok "backup: $f.bak-overclock-$TS"
+}
+
+move_aside() { # <path> [suffix]   never rm user data
+  local p="$1" dest="$1.bak-overclock-$TS${2:-}"
+  [ -e "$dest" ] && dest="$dest.$$"
+  if [ "$DRY" = 1 ]; then dry "mv $p -> $dest"; return 0; fi
+  mv "$p" "$dest"
+  ok "moved aside: $dest"
+}
+
+# ---------- overclock state (ownership record) ----------
+# $OC_DIR/state.json: {"version":1,"items":{"<kind>:<name>":{...}}}
+state_json() { if [ -f "$OC_STATE" ]; then cat "$OC_STATE"; else echo '{"version":1,"items":{}}'; fi; }
+owned() { state_json | jq -e --arg k "$1" '.items[$k] != null' >/dev/null; }
+state_get() { state_json | jq -r --arg k "$1" --arg f "$2" '.items[$k][$f] // empty'; }
+state_set() { # <key> <json object>
+  if [ "$DRY" = 1 ]; then return 0; fi
+  local new
+  new="$(state_json | jq --arg k "$1" --argjson v "$2" '.items[$k] = $v')"
+  write_json "$OC_STATE" "$new"
+}
+
+# ---------- preflight: validate JSON we may merge into ----------
+validate_json_files() {
+  if [ -e "$PSTATE" ]; then
+    jq -e 'type == "object"
+      and ((.marketplaces // []) | type == "array")
+      and ((.installed // []) | type == "array")
+      and ((.trusted_hosts // []) | type == "array")' "$PSTATE" >/dev/null 2>&1 \
+      || die "$PSTATE is not valid plugins.json (invalid JSON or wrong shape); aborting without writing anything"
+  fi
+  if [ -e "$MCP_FILE" ]; then
+    jq -e 'type == "object" and ((.mcpServers // {}) | type == "object")' "$MCP_FILE" >/dev/null 2>&1 \
+      || die "$MCP_FILE is not valid mcp.json (invalid JSON or wrong shape); aborting without writing anything"
+  fi
+  if [ -e "$OC_STATE" ]; then
+    jq -e '.items | type == "object"' "$OC_STATE" >/dev/null 2>&1 || die "$OC_STATE is corrupt; aborting"
+  fi
+}
+
+check_runtimes() {
+  local r
+  for r in python3 bun node; do
+    have "$r" || warn "$r not found: items that need it will be skipped"
+  done
+}
+
+# Pinned clone: git init + fetch exactly <commit>, verify HEAD.
+clone_pinned() { # <repo> <commit> <dest>
+  git init -q "$3"
+  git -C "$3" remote add origin "$1"
+  git -C "$3" fetch -q --depth=1 origin "$2"
+  git -C "$3" -c advice.detachedHead=false checkout -q FETCH_HEAD
+  [ "$(git -C "$3" rev-parse HEAD)" = "$2" ] || die "pinned clone of $1 did not land on $2"
+}
+
+# Scratch space on the same filesystem as $BASE so the final step is a rename.
+TMPROOT=""
+init_tmp() {
+  mkdir -p "$OC_DIR"
+  TMPROOT="$(mktemp -d "$OC_DIR/.tmp.XXXXXX")"
+  trap 'rm -rf "$TMPROOT"' EXIT   # our own scratch dir only
+}
+tmpdir() { [ -n "$TMPROOT" ] || die "internal: scratch dir not initialised"; mktemp -d "$TMPROOT/x.XXXXXX"; }
+
+# ======================================================================
+# plugins
+# ======================================================================
+PLUGIN_NAMES=() ; while IFS= read -r n; do PLUGIN_NAMES+=("$n"); done < <(jq -r '.plugins[].name' "$MANIFEST")
+plugin_src() { jq -r --arg n "$1" '.plugins[] | select(.name == $n) | .source' "$MANIFEST"; }
+plugin_runtime() { jq -r '.extension.command // empty' "$1/.synaps-plugin/plugin.json" 2>/dev/null; }
+# runtime known before cloning (manifest declares it in the plugin repo)
+plugin_runtime_static() { case "$1" in synaps-dash) echo bun ;; *) echo python3 ;; esac; }
+
+FRESH_PLUGINS=()   # cloned during this run -> upsert in plugins.json
+OWNED_PLUGINS=()   # managed by overclock   -> ensure entry in plugins.json
+
+install_plugins() {
+  head1 "plugins → $PLUGINS_DIR"
+  local n dest src rt tmp sha
+  for n in "${PLUGIN_NAMES[@]}"; do
+    dest="$PLUGINS_DIR/$n"; src="$(plugin_src "$n")"; rt="$(plugin_runtime_static "$n")"
+    if exists "$dest"; then
+      if owned "plugin:$n" && [ ! -L "$dest" ] && [ -d "$dest/.git" ]; then
+        ok "$n: installed @ $(short "$(head_of "$dest")")"
+        OWNED_PLUGINS+=("$n"); continue
+      fi
+      if [ "$FORCE" = 0 ]; then
+        skip "$n: skipped, $dest exists$([ -L "$dest" ] && echo " (symlink → $(readlink "$dest"))") and is not managed by overclock (use --force to replace)"
+        continue
+      fi
+    fi
+    if ! have "$rt"; then warn "$n: skipped, needs '$rt' which is not installed"; continue; fi
+    if [ "$DRY" = 1 ]; then
+      if exists "$dest"; then move_aside "$dest" .bak; fi
+      dry "git clone --depth=1 $src $dest"
+      dry "record $n in $PSTATE (marketplace $MARKETPLACE_NAME)"
+      continue
+    fi
+    tmp="$(tmpdir)/$n"
+    git clone -q --depth=1 "$src" "$tmp" || { warn "$n: git clone failed"; continue; }
+    sha="$(git -C "$tmp" rev-parse HEAD)"
+    rt="$(plugin_runtime "$tmp")"
+    if [ -n "$rt" ] && ! have "$rt"; then warn "$n: skipped, needs '$rt' which is not installed"; continue; fi
+    mkdir -p "$PLUGINS_DIR"
+    # .bak suffix keeps the moved-aside dir inert for the extension loader (manager.rs is_inert_plugin_dir_name)
+    if exists "$dest"; then move_aside "$dest" .bak; fi
+    mv "$tmp" "$dest"
+    state_set "plugin:$n" "$(jq -n --arg p "$dest" --arg c "$sha" --arg s "$src" --arg t "$NOW" '{path:$p,commit:$c,source:$s,installed_at:$t}')"
+    ok "$n: cloned @ $(short "$sha")"
+    FRESH_PLUGINS+=("$n"); OWNED_PLUGINS+=("$n")
+  done
+}
+
+# Merge plugins.json the way the /plugins TUI would have written it
+# (state.rs PluginsState / InstalledPlugin; actions.rs record_installed_plugin).
+merge_plugins_json() {
+  head1 "plugins.json → $PSTATE"
+  if [ "${#OWNED_PLUGINS[@]}" -eq 0 ]; then skip "no managed plugins installed yet; leaving plugins.json alone"; return 0; fi
+  local cur new entries="[]" n sha src
+  cur="$( [ -f "$PSTATE" ] && cat "$PSTATE" || echo '{}')"
+  for n in "${OWNED_PLUGINS[@]}"; do
+    sha="$(head_of "$PLUGINS_DIR/$n")"; src="$(plugin_src "$n")"
+    entries="$(jq --arg n "$n" --arg m "$MARKETPLACE_NAME" --arg s "$src" --arg c "$sha" --arg t "$NOW" \
+      --argjson fresh "$(in_list "$n" "${FRESH_PLUGINS[@]}" && echo true || echo false)" \
+      '. + [{fresh:$fresh, entry:{name:$n, marketplace:$m, source_url:$s, installed_commit:$c, latest_commit:null,
+             installed_at:$t, source_subdir:null, checksum_algorithm:null, checksum_value:null,
+             setup_status:{state:"not_required"}}}]' <<<"$entries")"
+  done
+  new="$(jq --argjson e "$entries" --slurpfile mp "$MANIFEST" \
+    --arg mn "$MARKETPLACE_NAME" --arg url "$MARKETPLACE_URL" --arg repo "$MARKETPLACE_REPO.git" --arg t "$NOW" '
+    .marketplaces = (.marketplaces // []) | .installed = (.installed // []) | .trusted_hosts = (.trusted_hosts // [])
+    | if any(.marketplaces[]; .name == $mn) then . else
+        .marketplaces += [{name:$mn, url:$url, description:$mp[0].description, last_refreshed:$t,
+          cached_plugins:[$mp[0].plugins[] | {name, source, version, description, index:null}], repo_url:$repo}]
+      end
+    | reduce $e[] as $x (.;
+        if any(.installed[]; .name == $x.entry.name) then
+          (if $x.fresh then .installed |= map(if .name == $x.entry.name then $x.entry else . end) else . end)
+        else .installed += [$x.entry] end)
+    | reduce ($e[] | .entry.source_url | capture("^https://(?<h>[^/]+)/(?<o>[^/]+)/") | "\(.h)/\(.o)") as $h (.;
+        if any(.trusted_hosts[]; . == $h) then . else .trusted_hosts += [$h] end)
+  ' <<<"$cur")"
+  if [ -f "$PSTATE" ] && [ "$(jq -S . "$PSTATE")" = "$(jq -S . <<<"$new")" ]; then ok "up to date"; return 0; fi
+  if [ "$DRY" = 1 ]; then
+    dry "merge into $PSTATE: installed=[${OWNED_PLUGINS[*]:-}] marketplace=$MARKETPLACE_NAME (existing entries preserved)"
+    return 0
+  fi
+  backup_file "$PSTATE"
+  write_json "$PSTATE" "$new"
+  ok "merged ($(jq '.installed | length' <<<"$new") installed, $(jq '.marketplaces | length' <<<"$new") marketplaces)"
+}
+
+# ======================================================================
+# agents
+# ======================================================================
+install_agents() {
+  head1 "agents → $AGENTS_DIR"
+  local f n dest sum
+  for f in "$SELF_DIR"/agents/*.md; do
+    n="$(basename "$f" .md)"; dest="$AGENTS_DIR/$n.md"; sum="$(sha256sum <"$f" | cut -d' ' -f1)"
+    if exists "$dest"; then
+      if owned "agent:$n" && [ ! -L "$dest" ]; then
+        if [ "$(sha256sum <"$dest" | cut -d' ' -f1)" = "$sum" ]; then ok "$n: installed"
+        else skip "$n: installed but locally modified (left alone)"; fi
+        continue
+      fi
+      if [ "$FORCE" = 0 ]; then skip "$n: skipped, $dest exists and is not managed by overclock"; continue; fi
+      move_aside "$dest"
+    fi
+    if [ "$DRY" = 1 ]; then dry "cp agents/$n.md $dest"; continue; fi
+    mkdir -p "$AGENTS_DIR"
+    cp "$f" "$dest"
+    state_set "agent:$n" "$(jq -n --arg p "$dest" --arg s "$sum" --arg t "$NOW" '{path:$p,sha256:$s,installed_at:$t}')"
+    ok "$n: installed"
+  done
+}
+
+# ======================================================================
+# skills (pinned clones, copied subdir)
+# ======================================================================
+SKILL_NAMES=() ; while IFS= read -r n; do SKILL_NAMES+=("$n"); done < <(jq -r '.skills | keys[]' "$LOCK")
+lockv() { jq -r --arg s "$1" --arg n "$2" --arg f "$3" '.[$s][$n][$f] // empty | if type == "array" then .[] else . end' "$LOCK"; }
+skill_installed_commit() { [ -f "$1/.SOURCE_COMMIT" ] && head -n1 "$1/.SOURCE_COMMIT" || true; }
+
+stage_skill() { # <name> -> prints staged dir
+  local n="$1" repo commit subdir note tmp out x
+  repo="$(lockv skills "$n" repo)"; commit="$(lockv skills "$n" commit)"; subdir="$(lockv skills "$n" subdir)"; note="$(lockv skills "$n" source_note)"
+  tmp="$(tmpdir)"
+  clone_pinned "$repo" "$commit" "$tmp/src" >&2
+  [ -f "$tmp/src/$subdir/SKILL.md" ] || die "$n: $subdir/SKILL.md not found at $commit"
+  out="$tmp/out"
+  cp -a "$tmp/src/$subdir" "$out"
+  while IFS= read -r x; do
+    if [ -n "$x" ] && [ ! -e "$out/$x" ]; then cp "$tmp/src/$x" "$out/$x"; fi
+  done < <(lockv skills "$n" extra_files)
+  printf '%s\n%s\ninstalled %s\n' "$commit" "${repo%.git}" "$NOW" >"$out/.SOURCE_COMMIT"
+  if [ -n "$note" ]; then printf '%s\n' "$note" >"$out/SOURCE"; fi
+  printf '%s' "$out"
+}
+
+install_skills() {
+  head1 "skills → $SKILLS_DIR"
+  local n dest commit out cur
+  for n in "${SKILL_NAMES[@]}"; do
+    dest="$SKILLS_DIR/$n"; commit="$(lockv skills "$n" commit)"
+    if exists "$dest"; then
+      if owned "skill:$n" && [ ! -L "$dest" ]; then
+        cur="$(skill_installed_commit "$dest")"
+        if [ "$cur" = "$commit" ]; then ok "$n: installed @ $(short "$cur") (pinned)"
+        else skip "$n: installed @ $(short "$cur"), pinned $(short "$commit"): run 'overclock update'"; fi
+        continue
+      fi
+      if [ "$FORCE" = 0 ]; then skip "$n: skipped, $dest exists$([ -L "$dest" ] && echo " (symlink)") and is not managed by overclock"; continue; fi
+    fi
+    if [ "$DRY" = 1 ]; then
+      if exists "$dest"; then move_aside "$dest"; fi
+      dry "clone $(lockv skills "$n" repo) @ $(short "$commit"), copy $(lockv skills "$n" subdir) -> $dest"
+      continue
+    fi
+    out="$(stage_skill "$n")"
+    mkdir -p "$SKILLS_DIR"
+    if exists "$dest"; then move_aside "$dest"; fi
+    mv "$out" "$dest"
+    state_set "skill:$n" "$(jq -n --arg p "$dest" --arg c "$commit" --arg t "$NOW" '{path:$p,commit:$c,installed_at:$t}')"
+    ok "$n: installed @ $(short "$commit")"
+  done
+}
+
+# ======================================================================
+# context-mode MCP
+# ======================================================================
+CM_REPO="$(jq -r '.mcp["context-mode"].repo' "$LOCK")"
+CM_COMMIT="$(jq -r '.mcp["context-mode"].commit' "$LOCK")"
+mcp_entry() { sed -e "s|@CLONE@|$CM_DIR|g" -e "s|@BASE@|$BASE|g" "$MCP_TEMPLATE" | jq -c '.mcpServers["context-mode"]'; }
+
+node_sqlite_ok() { # server.bundle.mjs is self-contained iff node:sqlite with FTS5 works (Node >= 22.5)
+  node -e 'const {DatabaseSync}=require("node:sqlite");const d=new DatabaseSync(":memory:");d.exec("CREATE VIRTUAL TABLE t USING fts5(x)")' >/dev/null 2>&1
+}
+
+CM_OK=0
+install_context_mode() {
+  head1 "context-mode → $CM_DIR"
+  if ! have node; then warn "context-mode: skipped, needs 'node' which is not installed"; return 0; fi
+  if exists "$CM_DIR"; then
+    if owned "mcp:context-mode" && [ -d "$CM_DIR/.git" ] && [ ! -L "$CM_DIR" ]; then
+      local cur; cur="$(head_of "$CM_DIR")"
+      if [ "$cur" = "$CM_COMMIT" ]; then ok "installed @ $(short "$cur") (pinned)"
+      else skip "installed @ $(short "$cur"), pinned $(short "$CM_COMMIT"): run 'overclock update'"; fi
+      CM_OK=1
+    elif [ "$FORCE" = 0 ]; then
+      skip "skipped, $CM_DIR exists and is not managed by overclock"; return 0
+    fi
+  fi
+  if [ "$CM_OK" = 0 ]; then
+    if [ "$DRY" = 1 ]; then
+      if exists "$CM_DIR"; then move_aside "$CM_DIR"; fi
+      dry "clone $CM_REPO @ $(short "$CM_COMMIT") -> $CM_DIR"
+      dry "mkdir -m 700 $BASE/context-mode $BASE/context-mode-shim"
+    else
+      local tmp; tmp="$(tmpdir)/cm"
+      clone_pinned "$CM_REPO" "$CM_COMMIT" "$tmp"
+      if exists "$CM_DIR"; then move_aside "$CM_DIR"; fi
+      mv "$tmp" "$CM_DIR"
+      state_set "mcp:context-mode" "$(jq -n --arg p "$CM_DIR" --arg c "$CM_COMMIT" --arg t "$NOW" '{path:$p,commit:$c,installed_at:$t}')"
+      ok "cloned @ $(short "$CM_COMMIT")"
+      local d; for d in "$BASE/context-mode" "$BASE/context-mode-shim"; do [ -d "$d" ] || mkdir -m 700 -p "$d"; done
+    fi
+    CM_OK=1
+  fi
+  if ! node_sqlite_ok; then
+    warn "context-mode: this node ($(node --version)) lacks node:sqlite+FTS5, so server.bundle.mjs falls back to better-sqlite3 from node_modules."
+    warn "  overclock does not install npm deps. Run this yourself:"
+    warn "    (cd \"$CM_DIR\" && npm install --omit=dev)"
+    warn "  or upgrade to Node >= 22.5."
+  fi
+}
+
+merge_mcp_json() {
+  head1 "mcp.json → $MCP_FILE"
+  [ "$CM_OK" = 1 ] || { skip "context-mode not installed; leaving mcp.json alone"; return 0; }
+  if [ -L "$MCP_FILE" ]; then warn "$MCP_FILE is a symlink (Synaps refuses to read symlinked mcp.json); not touching it"; return 0; fi
+  local cur want have_e new
+  cur="$( [ -f "$MCP_FILE" ] && cat "$MCP_FILE" || echo '{}')"
+  want="$(mcp_entry)"
+  have_e="$(jq -c '.mcpServers["context-mode"] // empty' <<<"$cur")"
+  if [ -n "$have_e" ]; then
+    if [ "$(jq -S . <<<"$have_e")" = "$(jq -S . <<<"$want")" ]; then ok "context-mode: up to date"; return 0; fi
+    if [ "$FORCE" = 0 ]; then skip "context-mode: skipped, a different 'context-mode' server is already configured (use --force to replace)"; return 0; fi
+  fi
+  new="$(jq --argjson e "$want" '.mcpServers = ((.mcpServers // {}) + {"context-mode": $e})' <<<"$cur")"
+  if [ "$DRY" = 1 ]; then dry "merge mcpServers.context-mode into $MCP_FILE (other servers preserved)"; return 0; fi
+  backup_file "$MCP_FILE"
+  write_json "$MCP_FILE" "$new"
+  ok "context-mode: added ($(jq '.mcpServers | length' <<<"$new") servers total)"
+}
+
+# ======================================================================
+# status
+# ======================================================================
+cmd_status() {
+  say "${C_B}synaps-overclocked status${C_0}  base=$BASE${PROFILE:+ profile=$PROFILE}"
+  local n dest c rec cur pin
+  head1 plugins
+  for n in "${PLUGIN_NAMES[@]}"; do
+    dest="$PLUGINS_DIR/$n"
+    if ! exists "$dest"; then say "  $n: missing"; continue; fi
+    if owned "plugin:$n" && [ ! -L "$dest" ]; then
+      c="$(head_of "$dest")"
+      rec="$( [ -f "$PSTATE" ] && jq -r --arg n "$n" '.installed[]? | select(.name == $n) | .installed_commit' "$PSTATE" || true)"
+      say "  $n: installed @ $(short "$c") (plugins.json: $( [ -n "$rec" ] && short "$rec" || echo none); unpinned, tracks HEAD)"
+    else
+      say "  $n: skipped (foreign)$([ -L "$dest" ] && echo " symlink → $(readlink "$dest")")"
+    fi
+  done
+  head1 agents
+  for f in "$SELF_DIR"/agents/*.md; do
+    n="$(basename "$f" .md)"; dest="$AGENTS_DIR/$n.md"
+    if ! exists "$dest"; then say "  $n: missing"
+    elif owned "agent:$n" && [ ! -L "$dest" ]; then
+      if cmp -s "$f" "$dest"; then say "  $n: installed"; else say "  $n: installed (differs from repo)"; fi
+    else say "  $n: skipped (foreign)"; fi
+  done
+  head1 skills
+  for n in "${SKILL_NAMES[@]}"; do
+    dest="$SKILLS_DIR/$n"; pin="$(lockv skills "$n" commit)"
+    if ! exists "$dest"; then say "  $n: missing (pinned $(short "$pin"))"
+    elif owned "skill:$n" && [ ! -L "$dest" ]; then
+      cur="$(skill_installed_commit "$dest")"
+      say "  $n: installed @ $(short "$cur") pinned $(short "$pin") $( [ "$cur" = "$pin" ] && echo "[ok]" || echo "[update available]")"
+    else say "  $n: skipped (foreign)"; fi
+  done
+  head1 mcp
+  if ! exists "$CM_DIR"; then say "  context-mode: missing (pinned $(short "$CM_COMMIT"))"
+  elif owned "mcp:context-mode"; then
+    cur="$(head_of "$CM_DIR")"
+    say "  context-mode: installed @ $(short "$cur") pinned $(short "$CM_COMMIT") $( [ "$cur" = "$CM_COMMIT" ] && echo "[ok]" || echo "[update available]")"
+  else say "  context-mode: skipped (foreign)"; fi
+  local e; e="$( [ -f "$MCP_FILE" ] && jq -c '.mcpServers["context-mode"] // empty' "$MCP_FILE" 2>/dev/null || true)"
+  if [ -z "$e" ]; then say "  mcp.json context-mode: missing"
+  elif [ "$(jq -S . <<<"$e")" = "$(mcp_entry | jq -S .)" ]; then say "  mcp.json context-mode: installed"
+  else say "  mcp.json context-mode: skipped (foreign entry)"; fi
+}
+
+# ======================================================================
+# update
+# ======================================================================
+cmd_update() {
+  head1 "update plugins"
+  local n dest before after changed=()
+  for n in "${PLUGIN_NAMES[@]}"; do
+    dest="$PLUGINS_DIR/$n"
+    if ! owned "plugin:$n" || [ -L "$dest" ] || [ ! -d "$dest/.git" ]; then skip "$n: not managed by overclock"; continue; fi
+    if is_dirty "$dest"; then skip "$n: local changes, not updating"; continue; fi
+    if [ "$DRY" = 1 ]; then dry "git -C $dest fetch origin && git merge --ff-only @{upstream}"; continue; fi
+    before="$(head_of "$dest")"
+    if ! git -C "$dest" fetch -q origin || ! git -C "$dest" merge -q --ff-only '@{upstream}' 2>/dev/null; then
+      warn "$n: cannot fast-forward (upstream rewritten?); left at $(short "$before")"; continue
+    fi
+    after="$(head_of "$dest")"
+    if [ "$before" = "$after" ]; then ok "$n: up to date @ $(short "$after")"; continue; fi
+    ok "$n: $(short "$before") → $(short "$after")"
+    state_set "plugin:$n" "$(state_json | jq --arg k "plugin:$n" --arg c "$after" '.items[$k] + {commit:$c}')"
+    changed+=("$n")
+  done
+  if [ "${#changed[@]}" -gt 0 ] && [ -f "$PSTATE" ]; then
+    local new; new="$(cat "$PSTATE")"
+    for n in "${changed[@]}"; do
+      new="$(jq --arg n "$n" --arg c "$(head_of "$PLUGINS_DIR/$n")" \
+        '.installed |= map(if .name == $n then .installed_commit = $c | .latest_commit = null else . end)' <<<"$new")"
+    done
+    backup_file "$PSTATE"; write_json "$PSTATE" "$new"; ok "plugins.json: commits updated"
+  fi
+
+  head1 "update pinned skills"
+  local pin cur out
+  for n in "${SKILL_NAMES[@]}"; do
+    dest="$SKILLS_DIR/$n"; pin="$(lockv skills "$n" commit)"
+    if ! owned "skill:$n" || [ -L "$dest" ] || [ ! -d "$dest" ]; then skip "$n: not managed by overclock"; continue; fi
+    cur="$(skill_installed_commit "$dest")"
+    if [ "$cur" = "$pin" ]; then ok "$n: at pinned $(short "$pin")"; continue; fi
+    if [ "$DRY" = 1 ]; then move_aside "$dest"; dry "install $n @ $(short "$pin") -> $dest"; continue; fi
+    out="$(stage_skill "$n")"
+    move_aside "$dest"
+    mv "$out" "$dest"
+    state_set "skill:$n" "$(jq -n --arg p "$dest" --arg c "$pin" --arg t "$NOW" '{path:$p,commit:$c,installed_at:$t}')"
+    ok "$n: $(short "$cur") → $(short "$pin")"
+  done
+
+  head1 "update context-mode"
+  if ! owned "mcp:context-mode" || [ -L "$CM_DIR" ] || [ ! -d "$CM_DIR/.git" ]; then skip "context-mode: not managed by overclock"; return 0; fi
+  cur="$(head_of "$CM_DIR")"
+  if [ "$cur" = "$CM_COMMIT" ]; then ok "context-mode: at pinned $(short "$CM_COMMIT")"; return 0; fi
+  if is_dirty "$CM_DIR"; then skip "context-mode: local changes, not updating"; return 0; fi
+  if [ "$DRY" = 1 ]; then dry "git -C $CM_DIR fetch --depth=1 origin $CM_COMMIT && checkout"; return 0; fi
+  git -C "$CM_DIR" fetch -q --depth=1 origin "$CM_COMMIT"
+  git -C "$CM_DIR" -c advice.detachedHead=false checkout -q FETCH_HEAD
+  state_set "mcp:context-mode" "$(state_json | jq --arg c "$CM_COMMIT" '.items["mcp:context-mode"] + {commit:$c}')"
+  ok "context-mode: $(short "$cur") → $(short "$CM_COMMIT")"
+}
+
+# ======================================================================
+main() {
+  case "$CMD" in
+    status) cmd_status; return ;;
+  esac
+  say "${C_B}overclock $CMD${C_0}  base=$BASE${PROFILE:+ profile=$PROFILE}$([ "$DRY" = 1 ] && echo "  (dry run: nothing is written)")$([ "$FORCE" = 1 ] && echo "  (--force)")"
+  validate_json_files
+  if [ "$DRY" = 0 ]; then init_tmp; fi
+  case "$CMD" in
+    install)
+      check_runtimes
+      install_plugins
+      merge_plugins_json
+      install_agents
+      install_skills
+      install_context_mode
+      merge_mcp_json
+      ;;
+    update) cmd_update ;;
+  esac
+  say ""; say "done."
+}
+main
