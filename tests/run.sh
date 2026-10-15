@@ -5,7 +5,7 @@ set -uo pipefail   # no -e: a failing case is recorded, not fatal
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 OC="$REPO/overclock"
-REAL_HOME="$(getent passwd "$(id -un)" | cut -d: -f6)"
+REAL_HOME="$( (getent passwd "$(id -un)" 2>/dev/null || true) | cut -d: -f6)"
 REAL_HOME="${REAL_HOME:-$HOME}"
 LOCK="$REPO/skills.lock.json"
 
@@ -13,13 +13,11 @@ PASS=0 FAIL=0 FAILED=()
 CASE=""
 
 # ---------- hard guard ----------
-guard_base() { # refuse anything that could be the real Synaps dir
-  local b; b="$(realpath -m "$1")"
-  case "$b" in
-    /home/haseeb/.synaps-cli|/home/haseeb/.synaps-cli/*) echo "GUARD: refusing real base dir $b" >&2; exit 99 ;;
-  esac
+canon() { realpath -m "$1" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
+guard_base() { # refuse the real Synaps dir or anything else under the real HOME
+  local b; b="$(canon "$1")"
   case "$b/" in
-    "$(realpath -m "$REAL_HOME")"/*) echo "GUARD: refusing base dir under real HOME: $b" >&2; exit 99 ;;
+    "$(canon "$REAL_HOME")"/*) echo "GUARD: refusing base dir under real HOME: $b" >&2; exit 99 ;;
   esac
 }
 
@@ -100,7 +98,7 @@ before="$(tree_hash "$B")"
 out="$(oc install 2>&1)"; rc=$?
 check "exit 0" test "$rc" = 0
 check "tree unchanged" test "$before" = "$(tree_hash "$B")"
-check "no backups written" bash -c "! find '$B' -name '*bak-overclock*' | grep -q ."
+check "no backups written" test ! -e "$B/overclocked/backups"
 
 # ======================================================================
 start "status output"
@@ -153,12 +151,14 @@ check "other plugins installed" jq -e '[.installed[].name] == ["agent-comms","sy
 check "status says foreign" grep -q "chronos: skipped (foreign) symlink" <<<"$(oc status)"
 out="$(oc install --force 2>&1)"; rc=$?
 check "--force exit 0" test "$rc" = 0
-bk="$(ls -d "$B"/plugins/chronos.bak-overclock-*.bak 2>/dev/null | head -n1)"
-check "--force moved symlink aside (inert .bak suffix)" test "$(readlink "$bk")" = "$target"
+bk="$(ls -d "$B"/overclocked/backups/*/plugins/chronos 2>/dev/null | head -n1)"
+check "--force moved symlink into backups/" test "$(readlink "$bk")" = "$target"
+check "nothing but plugins left in plugins/" test "$(ls "$B/plugins" | tr '\n' ' ')" = "agent-comms chronos synaps-dash "
 check "--force cloned chronos" test -d "$B/plugins/chronos/.git"
 check "--force recorded chronos" jq -e 'any(.installed[]; .name == "chronos")' "$B/plugins.json"
-check "--force backed up plugins.json" bash -c "ls '$B'/plugins.json.bak-overclock-* >/dev/null"
-check "--force moved agent aside" test -L "$(ls -d "$B"/agents/zero.md.bak-overclock-* | head -n1)"
+check "--force backed up plugins.json" bash -c "ls '$B'/overclocked/backups/*/plugins.json >/dev/null"
+check "--force moved agent aside" test -L "$(ls -d "$B"/overclocked/backups/*/agents/zero.md | head -n1)"
+check "no backups in scanned trees" bash -c "! ls '$B/plugins' '$B/skills' '$B/agents' | grep -q bak"
 check "target dir intact" test -f "$target/.synaps-plugin/plugin.json"
 
 # ======================================================================
@@ -174,7 +174,7 @@ check "exit 0" test "$rc" = 0
 check "other server preserved" jq -e '.mcpServers.other == {"command":"python3","args":["srv.py"],"env":{"K":"V"}}' "$B/mcp.json"
 check "unknown top-level key preserved" jq -e '.keepMe == {"x":1}' "$B/mcp.json"
 check "context-mode added" jq -e '.mcpServers["context-mode"].command == "node"' "$B/mcp.json"
-bk="$(ls "$B"/mcp.json.bak-overclock-* 2>/dev/null | head -n1)"
+bk="$(ls "$B"/overclocked/backups/*/mcp.json 2>/dev/null | head -n1)"
 check "timestamped backup equals original" test "$(cat "$bk")" = "$orig"
 # a foreign context-mode entry is left alone without --force
 new_home; mkdir -p "$B"
@@ -220,11 +220,165 @@ check "status flags update" grep -q "gauntlet-loop: installed @ f2c462e pinned 9
 out="$(oc update 2>&1)"; rc=$?
 check "update exit 0" test "$rc" = 0
 check "bumped to new pin" test "$(head -n1 "$B/skills/gauntlet-loop/.SOURCE_COMMIT")" = "$new"
-check "old copy moved aside" bash -c "ls -d '$B'/skills/gauntlet-loop.bak-overclock-* >/dev/null"
+check "old copy moved to backups/" test "$(head -n1 "$(ls -d "$B"/overclocked/backups/*/skills/gauntlet-loop | head -n1)/.SOURCE_COMMIT")" = "$old"
+check "skills/ holds only live skills" test "$(ls "$B/skills" | tr '\n' ' ')" = "gauntlet-loop last30days "
 check "last30days untouched" grep -q "last30days: at pinned" <<<"$out"
 before="$(tree_hash "$B/skills")"
 oc update >/dev/null 2>&1
 check "second update leaves skills alone" test "$before" = "$(tree_hash "$B/skills")"
+
+# ======================================================================
+# offline fixtures: local file:// upstreams for the 3 plugins, a fork of this
+# repo whose marketplace points at them, and skills/context-mode pre-made as
+# foreign symlinks so these cases never touch the network.
+# ======================================================================
+export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.invalid GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.invalid
+UP="$(tmpd)"
+mk_upstream() { # <name> <extension.command>
+  local w="$UP/$1-work"
+  git init -q -b main "$w"; mkdir -p "$w/.synaps-plugin"
+  printf '{"name":"%s","extension":{"runtime":"process","command":"%s","args":["main.py"]}}\n' "$1" "$2" >"$w/.synaps-plugin/plugin.json"
+  echo v1 >"$w/main.py"; git -C "$w" add -A; git -C "$w" commit -qm v1
+  git clone -q --bare "$w" "$UP/$1.git"
+  git -C "$w" remote add origin "$UP/$1.git"
+}
+push_commit() { echo "$2" >>"$UP/$1-work/main.py"; git -C "$UP/$1-work" commit -qam "$2"; git -C "$UP/$1-work" push -q origin main; }
+force_rewrite() { # new root commit force-pushed over main
+  local w="$UP/$1-work"
+  git -C "$w" checkout -q --orphan rewritten; echo rewritten >"$w/main.py"; git -C "$w" add -A; git -C "$w" commit -qm rewritten
+  git -C "$w" push -q -f origin rewritten:main
+}
+up_head() { git -C "$UP/$1.git" rev-parse main; }
+mk_upstream agent-comms ./bin/agent     # path command: relative to plugin dir, not a PATH lookup
+mk_upstream chronos python3
+mk_upstream synaps-dash bun
+FORK="$(tmpd)"
+cp -R "$REPO/." "$FORK/"; rm -rf "$FORK/.git"
+jq --arg u "$UP" '.plugins |= map(.source = "file://\($u)/\(.name).git")' "$REPO/.synaps-plugin/marketplace.json" >"$FORK/.synaps-plugin/marketplace.json"
+ocf() { guard_base "$SYNAPS_BASE_DIR"; "$FORK/overclock" "$@"; }
+offline_home() {
+  new_home
+  mkdir -p "$B/skills" "$B/overclocked"
+  ln -s /nonexistent "$B/skills/gauntlet-loop"; ln -s /nonexistent "$B/skills/last30days"; ln -s /nonexistent "$B/overclocked/context-mode"
+}
+pj_commit() { jq -r --arg n "$2" '.installed[] | select(.name == $n) | .installed_commit' "$1"; }
+
+# ======================================================================
+start "plugin update fast-forwards (file:// upstream)"
+offline_home
+out="$(ocf install 2>&1)"; rc=$?
+check "offline install exit 0" test "$rc" = 0
+check "path command not treated as missing runtime" test -d "$B/plugins/agent-comms/.git"
+check "path command warning shown" grep -q "agent-comms: ./bin/agent not present in the plugin dir" <<<"$out"
+c1="$(git -C "$B/plugins/chronos" rev-parse HEAD)"
+at1="$(jq -r '.installed[] | select(.name == "chronos") | .installed_at' "$B/plugins.json")"
+push_commit chronos v2; push_commit chronos v3
+out="$(ocf update 2>&1)"; rc=$?
+check "update exit 0" test "$rc" = 0
+check "chronos fast-forwarded" test "$(git -C "$B/plugins/chronos" rev-parse HEAD)" = "$(up_head chronos)"
+check "plugins.json installed_commit bumped" test "$(pj_commit "$B/plugins.json" chronos)" = "$(up_head chronos)"
+check "installed_at kept (TUI update semantics)" test "$(jq -r '.installed[] | select(.name == "chronos") | .installed_at' "$B/plugins.json")" = "$at1"
+check "state.json commit bumped" jq -e --arg c "$(up_head chronos)" '.items["plugin:chronos"].commit == $c' "$B/overclocked/state.json"
+check "other plugins untouched" grep -q "agent-comms: up to date" <<<"$out"
+check "plugins.json still schema-shaped" plugins_json_shape "$B/plugins.json"
+
+# ======================================================================
+start "force-pushed upstream: update fails loudly, update --force recovers"
+force_rewrite chronos
+before="$(git -C "$B/plugins/chronos" rev-parse HEAD)"
+out="$(ocf update 2>&1)"; rc=$?
+check "update still exits 0" test "$rc" = 0
+check "git error shown, not swallowed" grep -q "unrelated histories" <<<"$out"
+check "hint at --force" grep -q "update --force" <<<"$out"
+check "plugin left as it was" test "$(git -C "$B/plugins/chronos" rev-parse HEAD)" = "$before"
+out="$(ocf update --force 2>&1)"; rc=$?
+check "update --force exit 0" test "$rc" = 0
+check "recloned onto rewritten upstream" test "$(git -C "$B/plugins/chronos" rev-parse HEAD)" = "$(up_head chronos)"
+check "plugins.json commit follows" test "$(pj_commit "$B/plugins.json" chronos)" = "$(up_head chronos)"
+check "old copy in backups/" test "$(git -C "$(ls -d "$B"/overclocked/backups/*/plugins/chronos | head -n1)" rev-parse HEAD)" = "$before"
+check "plugins/ holds only live plugins" test "$(ls -A "$B/plugins" | tr '\n' ' ')" = "agent-comms chronos synaps-dash "
+out="$(ocf install --force 2>&1)"; rc=$?
+check "install --force reclones owned plugins" test "$(git -C "$B/plugins/chronos" rev-parse HEAD)" = "$(up_head chronos)"
+check "install --force leaves only live plugins" test "$(ls -A "$B/plugins" | tr '\n' ' ')" = "agent-comms chronos synaps-dash "
+
+# ======================================================================
+start "orphaned clone is adopted"
+offline_home
+mkdir -p "$B/plugins"
+git clone -q --depth=1 "file://$UP/chronos.git" "$B/plugins/chronos"
+git -C "$B/plugins/chronos" remote set-url origin "file://$UP/chronos/"   # .git + trailing slash normalised
+out="$(ocf install 2>&1)"; rc=$?
+check "exit 0" test "$rc" = 0
+check "reported as adopted" grep -q "chronos: adopted existing clone" <<<"$out"
+check "recorded in state.json" jq -e '.items["plugin:chronos"] != null' "$B/overclocked/state.json"
+check "recorded in plugins.json" test "$(pj_commit "$B/plugins.json" chronos)" = "$(git -C "$B/plugins/chronos" rev-parse HEAD)"
+check "no backup made" test ! -e "$B/overclocked/backups"
+check "status: adopted plugin installed" grep -q "chronos: installed @" <<<"$(ocf status)"
+
+# ======================================================================
+start "symlinked plugins.json is refused"
+offline_home
+real="$(tmpd)/plugins.json"; echo '{"keep":true}' >"$real"
+ln -s "$real" "$B/plugins.json"
+out="$(ocf install 2>&1)"; rc=$?
+check "exit 0" test "$rc" = 0
+check "warned" grep -q "plugins.json is a symlink; not rewriting it" <<<"$out"
+check "still a symlink" test "$(readlink "$B/plugins.json")" = "$real"
+check "target unchanged" test "$(cat "$real")" = '{"keep":true}'
+
+# ======================================================================
+start "--profile / SYNAPS_PROFILE"
+offline_home
+out="$(SYNAPS_PROFILE=work ocf install 2>&1)"; rc=$?
+check "exit 0" test "$rc" = 0
+check "plugins.json written to profile dir" jq -e '[.installed[].name] | sort == ["agent-comms","chronos","synaps-dash"]' "$B/work/plugins.json"
+check "no base plugins.json" test ! -e "$B/plugins.json"
+check "plugins still in base plugins/" test -d "$B/plugins/chronos/.git"
+check "--profile flag sees the same state" grep -q "chronos: installed @ .* (plugins.json: [0-9a-f]\{7\};" <<<"$(ocf status --profile work)"
+out="$(ocf install --profile 2>&1)"; rc=$?
+check "--profile without a value dies" test "$rc" != 0
+check "--profile message" grep -q "needs a profile name" <<<"$out"
+
+# ======================================================================
+start "bad environments die cleanly"
+out="$(env -u HOME -u SYNAPS_BASE_DIR "$OC" status 2>&1)"; rc=$?
+check "unset HOME: nonzero" test "$rc" != 0
+check "unset HOME: clean message" grep -q "neither SYNAPS_BASE_DIR nor HOME is set" <<<"$out"
+check "unset HOME: no bash error" bash -c '! grep -q "unbound variable" <<<"$1"' _ "$out"
+out="$(SYNAPS_BASE_DIR=/ "$OC" status 2>&1)"; rc=$?
+check "SYNAPS_BASE_DIR=/ nonzero" test "$rc" != 0
+check "SYNAPS_BASE_DIR=/ message" grep -q "refusing to use / as the Synaps base dir" <<<"$out"
+
+# ======================================================================
+start "uninstall leaves nothing live"
+offline_home
+ocf install >/dev/null 2>&1
+before="$(tree_hash "$B")"
+out="$(ocf uninstall --dry-run 2>&1)"; rc=$?
+check "uninstall --dry-run exit 0" test "$rc" = 0
+check "uninstall --dry-run writes nothing" test "$before" = "$(tree_hash "$B")"
+out="$(ocf uninstall 2>&1)"; rc=$?
+check "uninstall exit 0" test "$rc" = 0
+check "plugins/ empty" test -z "$(ls -A "$B/plugins")"
+check "agents/ empty" test -z "$(ls -A "$B/agents")"
+check "foreign skills symlinks untouched" test -L "$B/skills/gauntlet-loop"
+check "plugins.json: no entries of ours" jq -e '(.installed | length) == 0 and all(.marketplaces[]; .name != "synaps-overclocked")' "$B/plugins.json"
+check "state.json retired" test ! -e "$B/overclocked/state.json"
+check "removed/ holds the plugins" test -d "$(ls -d "$B"/overclocked/removed/*/plugins/chronos | head -n1)/.git"
+check "status after uninstall: missing" grep -q "chronos: missing" <<<"$(ocf status)"
+out="$(ocf install 2>&1)"; rc=$?
+check "reinstall after uninstall works" test -d "$B/plugins/chronos/.git"
+
+# full (network) install from the first case
+HOME="$FRESH_HOME" SYNAPS_BASE_DIR="$FRESH_B"; export HOME SYNAPS_BASE_DIR; B="$FRESH_B"
+out="$(oc uninstall 2>&1)"; rc=$?
+check "full uninstall exit 0" test "$rc" = 0
+check "full: plugins/ empty" test -z "$(ls -A "$B/plugins")"
+check "full: skills/ empty" test -z "$(ls -A "$B/skills")"
+check "full: agents/ empty" test -z "$(ls -A "$B/agents")"
+check "full: mcp.json context-mode gone" jq -e '.mcpServers["context-mode"] == null' "$B/mcp.json"
+check "full: context-mode clone moved" test -d "$(ls -d "$B"/overclocked/removed/*/overclocked/context-mode | head -n1)"
+check "full: backups of JSON kept" bash -c "ls '$B'/overclocked/backups/*/mcp.json '$B'/overclocked/backups/*/plugins.json >/dev/null"
 
 # ======================================================================
 start "refuses root"
