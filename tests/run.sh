@@ -23,8 +23,12 @@ guard_base() { # refuse anything that could be the real Synaps dir
   esac
 }
 
+SCRATCH="$(mktemp -d)"   # every throwaway dir lives here; removed on exit
+trap 'rm -rf "$SCRATCH"' EXIT
+tmpd() { mktemp -d "$SCRATCH/t.XXXXXX"; }
+
 new_home() { # sets HOME + SYNAPS_BASE_DIR for this case
-  local h; h="$(mktemp -d)"
+  local h; h="$(tmpd)"
   export HOME="$h" SYNAPS_BASE_DIR="$h/.synaps-cli"
   unset SYNAPS_PROFILE
   guard_base "$SYNAPS_BASE_DIR"
@@ -135,7 +139,7 @@ check "update --dry-run writes nothing" test "$before" = "$(tree_hash "$FRESH_B"
 # ======================================================================
 start "pre-existing symlinked plugin is skipped"
 new_home
-target="$(mktemp -d)"; mkdir -p "$target/.synaps-plugin"; echo '{"name":"chronos"}' >"$target/.synaps-plugin/plugin.json"
+target="$(tmpd)"; mkdir -p "$target/.synaps-plugin"; echo '{"name":"chronos"}' >"$target/.synaps-plugin/plugin.json"
 mkdir -p "$B/plugins" "$B/agents"
 ln -s "$target" "$B/plugins/chronos"
 ln -s "$target/.synaps-plugin/plugin.json" "$B/agents/zero.md"
@@ -206,7 +210,7 @@ start "update bumps a pinned skill only when the lock changes"
 new_home
 old="f2c462ee0727035719e4b5c8d69195f8ba4f1c4e"   # gauntlet-loop parent of the pinned commit
 new="$(lock '.skills["gauntlet-loop"].commit')"
-fork="$(mktemp -d)"
+fork="$(tmpd)"
 cp -r "$REPO/." "$fork/"; rm -rf "$fork/.git"
 jq --arg c "$old" '.skills["gauntlet-loop"].commit = $c' "$LOCK" >"$fork/skills.lock.json"
 mkdir -p "$B/plugins"; for p in agent-comms chronos synaps-dash; do ln -s /nonexistent "$B/plugins/$p"; done
@@ -225,7 +229,7 @@ check "second update leaves skills alone" test "$before" = "$(tree_hash "$B/skil
 # ======================================================================
 start "refuses root"
 new_home
-fakebin="$(mktemp -d)"; printf '#!/bin/sh\necho 0\n' >"$fakebin/id"; chmod +x "$fakebin/id"
+fakebin="$(tmpd)"; printf '#!/bin/sh\necho 0\n' >"$fakebin/id"; chmod +x "$fakebin/id"
 out="$(PATH="$fakebin:$PATH" oc install 2>&1)"; rc=$?
 check "uid 0 is refused" test "$rc" != 0
 check "root message" grep -q "refusing to run as root" <<<"$out"
