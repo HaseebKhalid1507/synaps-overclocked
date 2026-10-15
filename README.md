@@ -27,17 +27,23 @@ git clone https://github.com/HaseebKhalid1507/synaps-overclocked ~/synaps-overcl
 Keep the checkout around if you want `overclock status` / `overclock update` later. Agents are copied, not linked, so deleting it doesn't break anything.
 
 ```
-overclock [install|status|update|uninstall] [--dry-run] [--force] [--profile NAME]
+overclock [install|status|update|uninstall] [--dry-run] [--reclone] [--replace-foreign] [--profile NAME]
 
-  install    (default) install whatever is missing; rerunning is a no-op
-  status     each item: installed / skipped (foreign) / missing, plus commit vs pinned
-  update     fast-forward the plugins; re-pin skills/context-mode when skills.lock.json changed
-  uninstall  move everything overclock installed to BASE/overclocked/removed/<ts>/
-  --dry-run  print every action, write nothing
-  --force    install: replace items overclock didn't install, and reclone the plugins it did
-             update:  reclone plugins that can't fast-forward (upstream history rewritten)
-             replaced items are moved to BASE/overclocked/backups/<ts>/, never deleted
+  install            (default) install whatever is missing; rerunning is a no-op
+  status             each item: installed / skipped (foreign) / missing, plus commit vs pinned
+  update             fast-forward the plugins; re-pin skills/context-mode when skills.lock.json changed
+  uninstall          move everything overclock installed to BASE/overclocked/removed/<ts>/
+                     and put back anything --replace-foreign displaced
+  --dry-run          print every action, write nothing
+  --reclone          safe: touches only items overclock owns. install reclones its plugins and
+                     refreshes agents you edited; update reclones plugins that can't fast-forward
+                     (rewritten upstream) or have local changes
+  --replace-foreign  explicit: moves items overclock did NOT install (dirs, dev symlinks, a
+                     different context-mode mcp entry) aside and installs ours instead
+  --force            deprecated alias for --reclone (prints a notice)
 ```
+
+Anything replaced is moved to `BASE/overclocked/backups/<ts>/`, never deleted.
 
 Restart Synaps afterwards so it loads the new plugins and MCP server.
 
@@ -72,16 +78,23 @@ Everything lives under `BASE="${SYNAPS_BASE_DIR:-$HOME/.synaps-cli}"`:
 | `context-mode/`, `context-mode-shim/` | empty state dirs for context-mode (mode 700) |
 | `mcp.json` | jq merge: adds `mcpServers.context-mode`. Other servers and keys are preserved. |
 | `overclocked/state.json` | the record of what overclock installed. This is how "ours" is told apart from "foreign". |
-| `overclocked/backups/<ts>/` | everything `--force`/`update` replaced, plus a copy of `plugins.json`/`mcp.json` before each rewrite, at its path relative to `BASE` |
+| `overclocked/backups/<ts>/` | everything `--reclone`/`--replace-foreign`/`update` replaced, plus a copy of `plugins.json`/`mcp.json` before each rewrite, at its path relative to `BASE` |
 | `overclocked/removed/<ts>/` | what `uninstall` moved out |
 
-**Trust:** `trusted_hosts` gets `github.com/HaseebKhalid1507`, the same thing the `/plugins` trust prompt records when you accept it. That means any future `/plugins` install from that GitHub owner skips the trust prompt. `uninstall` leaves that entry in place; delete it from `plugins.json` if you don't want it.
+**Trust:** `trusted_hosts` gets `github.com/HaseebKhalid1507`, the same thing the `/plugins` trust prompt records when you accept it. That means any future `/plugins` install from that GitHub owner skips the trust prompt. overclock records in `state.json` whether it added that host (and the `synaps-overclocked` marketplace). `uninstall` removes only what overclock added. If they were already there, they stay.
 
 Safety rules:
-- An existing plugin dir, agent file or skill dir (symlinks included) that overclock didn't install is **skipped** and reported. With `--force` it is moved to `BASE/overclocked/backups/<ts>/<same relative path>`. Backups never sit inside `plugins/`, `skills/` or `agents/`, so Synaps can't load a stale copy.
-- One exception to "skipped": a plugin dir that is a real git clone whose `origin` is the same repo (ignoring `.git` and a trailing `/`) gets **adopted**. That covers an interrupted overclock run and a copy installed through `/plugins`.
+- An existing plugin dir, agent file or skill dir (symlinks included) that overclock didn't install is **skipped** and reported. `--reclone` never touches it. Only `--replace-foreign` moves it to `BASE/overclocked/backups/<ts>/<same relative path>`. The original path, the backup path and (for symlinks) the link target are recorded in `state.json`, so `uninstall` can put it back. Backups never sit inside `plugins/`, `skills/` or `agents/`, so Synaps can't load a stale copy.
+- **Adoption.** A plugin dir (or the context-mode checkout) that isn't installed by overclock but looks like an overclock install gets adopted instead of skipped. That covers an interrupted overclock run and a copy installed through `/plugins`. All three must hold:
+  - it is not a symlink
+  - its `origin` is the same repo (ignoring `.git`, a trailing `/` and case)
+  - it is clean: `git status --porcelain` is empty, and it has no commits ahead of `@{upstream}`
+
+  A dev clone with local work is treated as foreign.
 - Before `plugins.json` or `mcp.json` is rewritten, it is copied into the backups dir. Writes are atomic (temp file + rename). If either file is invalid JSON or the wrong shape, overclock aborts before writing anything. If either one is a symlink, overclock warns and leaves it alone, because a rename would replace the link.
-- A `context-mode` MCP entry that points somewhere else is left alone unless `--force` is given.
+- A `context-mode` MCP entry that points somewhere else is left alone unless `--replace-foreign` is given. In that case the old entry is recorded and `uninstall` restores it.
+- Rewritten `plugins.json`/`mcp.json` keep their file mode. New files are created `0600`.
+- Recorded paths must sit under `BASE` with no `.`/`..` components. `SYNAPS_BASE_DIR` itself may not contain them either.
 - Refuses to run as root. Never runs npm/bun/cargo installs.
 
 ### Profiles
@@ -96,16 +109,17 @@ If `SYNAPS_PROFILE` is set (or `--profile NAME` is passed), the paths follow Syn
 
 ```bash
 overclock uninstall --dry-run   # review
-overclock uninstall             # pass --profile NAME if you installed under a profile
+overclock uninstall
 ```
 
-This works from `BASE/overclocked/state.json`:
-- Every item overclock installed is moved to `BASE/overclocked/removed/<ts>/`, outside every dir Synaps scans. Nothing is deleted.
-- The plugins' `installed` entries and the `synaps-overclocked` marketplace are dropped from the profile-aware `plugins.json`.
-- `mcpServers.context-mode` is dropped from `mcp.json`, but only if it is still the entry overclock wrote.
+This works from `BASE/overclocked/state.json`, using the profile recorded at install time. If you pass a different `--profile`, you get a warning and the recorded one is used.
+- Every item overclock installed is moved to `BASE/overclocked/removed/<ts>/`, outside every dir Synaps scans. Nothing is deleted. Items that have since become a symlink, or were never moved, are left alone.
+- From `plugins.json`, only `synaps-overclocked`-marketplace entries for plugins that were actually moved are dropped. The marketplace and the trusted host are removed only if overclock added them and nothing still uses them.
+- `mcpServers.context-mode` is dropped from `mcp.json`, but only if it is still the entry overclock wrote. A user entry that `--replace-foreign` displaced is put back.
+- **Restore.** Every foreign item `--replace-foreign` displaced is moved back to its original path, but only if that path is empty at that point. A symlink comes back with the same target. If the path is occupied, the item stays in backups and uninstall prints where it is.
 - Both JSON files are backed up first and written atomically.
 - `state.json` itself is retired into the same `removed/` dir.
-- The context-mode data dirs (`BASE/context-mode`, `BASE/context-mode-shim`) and `trusted_hosts` are left alone.
+- The context-mode data dirs (`BASE/context-mode`, `BASE/context-mode-shim`) are left alone.
 
 Delete `BASE/overclocked/removed/` yourself once you're sure.
 
