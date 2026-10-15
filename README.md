@@ -27,13 +27,16 @@ git clone https://github.com/HaseebKhalid1507/synaps-overclocked ~/synaps-overcl
 Keep the checkout around if you want `overclock status` / `overclock update` later. Agents are copied, not linked, so deleting it doesn't break anything.
 
 ```
-overclock [install|status|update] [--dry-run] [--force] [--profile NAME]
+overclock [install|status|update|uninstall] [--dry-run] [--force] [--profile NAME]
 
   install    (default) install whatever is missing; rerunning is a no-op
   status     each item: installed / skipped (foreign) / missing, plus commit vs pinned
   update     fast-forward the plugins; re-pin skills/context-mode when skills.lock.json changed
+  uninstall  move everything overclock installed to BASE/overclocked/removed/<ts>/
   --dry-run  print every action, write nothing
-  --force    replace items overclock didn't install (the old one is moved aside, never deleted)
+  --force    install: replace items overclock didn't install, and reclone the plugins it did
+             update:  reclone plugins that can't fast-forward (upstream history rewritten)
+             replaced items are moved to BASE/overclocked/backups/<ts>/, never deleted
 ```
 
 Restart Synaps afterwards so it loads the new plugins and MCP server.
@@ -62,17 +65,22 @@ Everything lives under `BASE="${SYNAPS_BASE_DIR:-$HOME/.synaps-cli}"`:
 | path | what |
 |---|---|
 | `plugins/{agent-comms,chronos,synaps-dash}/` | `git clone --depth=1`, same as the `/plugins` TUI |
-| `plugins.json` | jq merge: adds the `synaps-overclocked` marketplace, one `installed` entry per plugin (`installed_commit` from `git rev-parse HEAD`, `setup_status: not_required`) and trusted host `github.com/HaseebKhalid1507`. Existing keys and entries are preserved. |
+| `plugins.json` | jq merge: adds the `synaps-overclocked` marketplace, one `installed` entry per plugin (`installed_commit` from `git rev-parse HEAD`, `setup_status: not_required`) and the trusted host `github.com/HaseebKhalid1507`. Existing keys and entries are preserved. |
 | `agents/<name>.md` | copied from `agents/` |
 | `skills/{gauntlet-loop,last30days}/` | skill dir from the pinned commit, plus `.SOURCE_COMMIT` (and `SOURCE` for gauntlet-loop) |
 | `overclocked/context-mode/` | pinned git checkout of context-mode |
 | `context-mode/`, `context-mode-shim/` | empty state dirs for context-mode (mode 700) |
 | `mcp.json` | jq merge: adds `mcpServers.context-mode`. Other servers and keys are preserved. |
 | `overclocked/state.json` | the record of what overclock installed. This is how "ours" is told apart from "foreign". |
+| `overclocked/backups/<ts>/` | everything `--force`/`update` replaced, plus a copy of `plugins.json`/`mcp.json` before each rewrite, at its path relative to `BASE` |
+| `overclocked/removed/<ts>/` | what `uninstall` moved out |
+
+**Trust:** `trusted_hosts` gets `github.com/HaseebKhalid1507`, the same thing the `/plugins` trust prompt records when you accept it. That means any future `/plugins` install from that GitHub owner skips the trust prompt. `uninstall` leaves that entry in place; delete it from `plugins.json` if you don't want it.
 
 Safety rules:
-- An existing plugin dir, agent file or skill dir (symlinks included) that overclock didn't install is **skipped** and reported. With `--force` it is moved to `<path>.bak-overclock-<ts>`. Plugin dirs get an extra `.bak` suffix, so Synaps' extension loader treats the moved copy as inert instead of loading it twice.
-- Before `plugins.json` or `mcp.json` is rewritten, it is copied to `<file>.bak-overclock-<ts>`. Writes are atomic (temp file + rename). If either file is invalid JSON or the wrong shape, overclock aborts before writing anything.
+- An existing plugin dir, agent file or skill dir (symlinks included) that overclock didn't install is **skipped** and reported. With `--force` it is moved to `BASE/overclocked/backups/<ts>/<same relative path>`. Backups never sit inside `plugins/`, `skills/` or `agents/`, so Synaps can't load a stale copy.
+- One exception to "skipped": a plugin dir that is a real git clone whose `origin` is the same repo (ignoring `.git` and a trailing `/`) gets **adopted**. That covers an interrupted overclock run and a copy installed through `/plugins`.
+- Before `plugins.json` or `mcp.json` is rewritten, it is copied into the backups dir. Writes are atomic (temp file + rename). If either file is invalid JSON or the wrong shape, overclock aborts before writing anything. If either one is a symlink, overclock warns and leaves it alone, because a rename would replace the link.
 - A `context-mode` MCP entry that points somewhere else is left alone unless `--force` is given.
 - Refuses to run as root. Never runs npm/bun/cargo installs.
 
@@ -86,20 +94,20 @@ If `SYNAPS_PROFILE` is set (or `--profile NAME` is passed), the paths follow Syn
 
 ## Uninstall
 
-overclock has no uninstall command yet. Everything it installed is listed in `BASE/overclocked/state.json`:
-
 ```bash
-BASE="${SYNAPS_BASE_DIR:-$HOME/.synaps-cli}"
-jq -r '.items[].path' "$BASE/overclocked/state.json"        # review first
-# move them out of the way (or rm, your call):
-jq -r '.items[].path' "$BASE/overclocked/state.json" | while read -r p; do mv "$p" "$p.removed"; done
-# drop our entries from the JSON configs (backups first):
-cp "$BASE/plugins.json" "$BASE/plugins.json.bak" && jq '.installed |= map(select(.marketplace != "synaps-overclocked")) | .marketplaces |= map(select(.name != "synaps-overclocked"))' "$BASE/plugins.json.bak" > "$BASE/plugins.json"
-cp "$BASE/mcp.json" "$BASE/mcp.json.bak" && jq 'del(.mcpServers["context-mode"])' "$BASE/mcp.json.bak" > "$BASE/mcp.json"
-mv "$BASE/overclocked" "$BASE/overclocked.removed"
+overclock uninstall --dry-run   # review
+overclock uninstall             # pass --profile NAME if you installed under a profile
 ```
 
-Plugins installed through the `/plugins` TUI can also be uninstalled from there.
+This works from `BASE/overclocked/state.json`:
+- Every item overclock installed is moved to `BASE/overclocked/removed/<ts>/`, outside every dir Synaps scans. Nothing is deleted.
+- The plugins' `installed` entries and the `synaps-overclocked` marketplace are dropped from the profile-aware `plugins.json`.
+- `mcpServers.context-mode` is dropped from `mcp.json`, but only if it is still the entry overclock wrote.
+- Both JSON files are backed up first and written atomically.
+- `state.json` itself is retired into the same `removed/` dir.
+- The context-mode data dirs (`BASE/context-mode`, `BASE/context-mode-shim`) and `trusted_hosts` are left alone.
+
+Delete `BASE/overclocked/removed/` yourself once you're sure.
 
 ## Tests
 
@@ -107,7 +115,11 @@ Plugins installed through the `/plugins` TUI can also be uninstalled from there.
 tests/run.sh
 ```
 
-Every case runs with a throwaway `HOME` and `SYNAPS_BASE_DIR`. The suite refuses to start if the base dir resolves to anything under your real home. It needs network access, because it clones from GitHub.
+Every case runs with a throwaway `HOME` and `SYNAPS_BASE_DIR`. The suite refuses to start if the base dir resolves to anything under your real home. The full-install cases need network access, because they clone from GitHub. The update, force-push, adoption, profile and uninstall cases use local `file://` repos.
+
+## Tested on
+
+Linux with bash 5 and GNU coreutils; that's where the suite runs. macOS (bash 3.2, BSD userland) is **best-effort**: the script avoids `mapfile`, associative arrays, unguarded empty-array expansion, `realpath`/`readlink -f`/`sed -i`, and falls back to `shasum -a 256` when `sha256sum` is missing, but it hasn't been run there. `tests/run.sh` itself uses GNU `find -printf`, so it's Linux-only.
 
 ## License
 
