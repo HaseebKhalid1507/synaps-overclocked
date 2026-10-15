@@ -9,7 +9,7 @@ Our plugin stack in a box. One command turns stock SynapsCLI into Synaps the way
 | plugin | `agent-comms`: session awareness, cross-session messages and claims | [agent-comms](https://github.com/HaseebKhalid1507/agent-comms) (tracks HEAD) | `python3` |
 | plugin | `chronos`: injects the current time before every user message | [synaps-chronos](https://github.com/HaseebKhalid1507/synaps-chronos) (tracks HEAD) | `python3` |
 | plugin | `synaps-dash`: browser client for the session daemon | [synaps-dash](https://github.com/HaseebKhalid1507/synaps-dash) (tracks HEAD) | `bun` |
-| agents | spike, shady, chrollo, case, silverhand, yoru, joestar, gojo, starlord, okarin, zero | `agents/` in this repo | – |
+| agents | spike, shady, chrollo, case, silverhand, yoru, joestar, gojo, starlord, okarin, zero, ryuga, 007, saul | `agents/` in this repo | – |
 | skill | `gauntlet-loop` | [robonuggets/gauntlet-loop](https://github.com/robonuggets/gauntlet-loop) @ `9b1975a` (CC BY 4.0, technique by Matt Shumer) | – |
 | skill | `last30days` | [mvanhorn/last30days-skill](https://github.com/mvanhorn/last30days-skill) @ `0188da7` (MIT) | `python3` at runtime |
 | MCP | `context-mode` | [mksglu/context-mode](https://github.com/mksglu/context-mode) @ `928bdf1` (Elastic License 2.0) | `node` ≥ 22.5 (see below) |

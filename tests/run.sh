@@ -73,7 +73,7 @@ for p in agent-comms chronos synaps-dash; do
   check "plugin $p cloned" test -f "$B/plugins/$p/.synaps-plugin/plugin.json"
   check "plugin $p commit == plugins.json" test "$(git -C "$B/plugins/$p" rev-parse HEAD)" = "$(jq -r --arg n "$p" '.installed[] | select(.name == $n) | .installed_commit' "$B/plugins.json")"
 done
-check "11 agents" test "$(ls "$B/agents" | wc -l)" = 11
+check "all repo agents installed" test "$(ls "$B/agents" | wc -l)" = "$(ls "$REPO/agents" | wc -l)"
 check "agent copied verbatim" cmp "$REPO/agents/spike.md" "$B/agents/spike.md"
 check "plugins.json valid + schema-shaped" plugins_json_shape "$B/plugins.json"
 check "plugins.json marketplace linked" jq -e '.marketplaces[0].name == "synaps-overclocked" and all(.installed[]; .marketplace == "synaps-overclocked")' "$B/plugins.json"
