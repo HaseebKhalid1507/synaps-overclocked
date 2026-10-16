@@ -1,7 +1,7 @@
 {
   "name": "synaps-overclocked",
-  "version": "1.0.0",
-  "description": "Haseeb's Synaps plugin stack: session awareness, time injection and the browser dashboard.",
+  "version": "1.1.0",
+  "description": "Haseeb's Synaps plugin stack: session awareness, time injection, the browser dashboard, prompt-cache keepalive, a d20 and a tool-output compressor.",
   "trust": {
     "publisher": "Haseeb Khalid",
     "homepage": "https://github.com/HaseebKhalid1507/synaps-overclocked"
@@ -26,6 +26,27 @@
       "source": "https://github.com/HaseebKhalid1507/synaps-dash.git",
       "version": "0.1.0",
       "description": "Browser client for the synaps session daemon (needs bun).",
+      "license": "MIT"
+    },
+    {
+      "name": "heartbeat",
+      "source": "https://github.com/HaseebKhalid1507/synaps-heartbeat.git",
+      "version": "0.2.0",
+      "description": "Keeps the Anthropic prompt cache warm during idle gaps with a tiny keepalive turn before the 5-minute TTL.",
+      "license": "MIT"
+    },
+    {
+      "name": "d20",
+      "source": "https://github.com/HaseebKhalid1507/synaps-d20.git",
+      "version": "0.1.0",
+      "description": "Rolls a d20 before every user message and injects the result into context.",
+      "license": "MIT"
+    },
+    {
+      "name": "crush",
+      "source": "https://github.com/HaseebKhalid1507/Crush-Synaps.git",
+      "version": "0.1.0",
+      "description": "Native Rust tool-output compressor (after_tool_call). Built on install with cargo (needs a Rust toolchain).",
       "license": "MIT"
     }
   ]

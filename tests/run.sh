@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Test suite for ./overclock. Every case runs in a throwaway HOME.
-# Needs network (clones from GitHub), git, jq, python3, node, bun.
+# Needs network (clones from GitHub), git, jq, python3, node, bun. Never runs a real cargo.
 set -uo pipefail   # no -e: a failing case is recorded, not fatal
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -25,6 +25,31 @@ SCRATCH="$(mktemp -d)"   # every throwaway dir lives here; removed on exit
 trap 'rm -rf "$SCRATCH"' EXIT
 tmpd() { mktemp -d "$SCRATCH/t.XXXXXX"; }
 
+# The suite never runs a real cargo: PATH is a symlink farm of the current PATH minus
+# `cargo`, so crush is skipped unless a case puts a stub cargo in front.
+NOCARGO="$SCRATCH/nocargo-bin"; mkdir -p "$NOCARGO"
+IFS=: read -r -a _pdirs <<<"$PATH"
+for _d in "${_pdirs[@]}"; do
+  [ -d "$_d" ] || continue
+  for _f in "$_d"/*; do
+    _b="${_f##*/}"
+    if [ "$_b" != cargo ] && [ -x "$_f" ] && [ ! -d "$_f" ] && [ ! -e "$NOCARGO/$_b" ]; then ln -s "$_f" "$NOCARGO/$_b"; fi
+  done
+done
+export PATH="$NOCARGO"
+STUBS="$SCRATCH/stub-cargo"; mkdir -p "$STUBS"
+CARGO_STUB_LOG="$SCRATCH/cargo-calls.log"; export CARGO_STUB_LOG
+cat >"$STUBS/cargo" <<'EOF'
+#!/bin/sh
+# stub cargo: records the call, fakes `cargo build` (CARGO_STUB_FAIL=1 makes it fail)
+echo "$PWD|$*" >>"$CARGO_STUB_LOG"
+if [ -n "${CARGO_STUB_FAIL:-}" ]; then echo "error[E0000]: stub build failure" >&2; exit 101; fi
+mkdir -p target/release && printf '#!/bin/sh\necho crush\n' >target/release/crush && chmod +x target/release/crush
+EOF
+chmod +x "$STUBS/cargo"
+with_cargo() { PATH="$STUBS:$NOCARGO" "$@"; }
+ALL_PLUGINS="$(jq -r '.plugins[].name' "$REPO/.synaps-plugin/marketplace.json" "$REPO/subdir-plugins.json")"
+
 new_home() { # sets HOME + SYNAPS_BASE_DIR for this case
   local h; h="$(tmpd)"
   export HOME="$h" SYNAPS_BASE_DIR="$h/.synaps-cli"
@@ -47,6 +72,7 @@ tree_hash() { # content + layout + symlink targets + modes
   ( cd "$1" && { find . -printf '%y %m %p %l\n' | sort; find . -type f -print0 | sort -z | xargs -0 -r sha256sum; } ) | sha256sum | cut -d' ' -f1
 }
 lock() { jq -r "$1" "$LOCK"; }
+short() { printf '%s' "$1" | cut -c1-7; }
 
 # plugins.json shape per agent-engine skills/state.rs (PluginsState / InstalledPlugin / Marketplace)
 plugins_json_shape() {
@@ -57,7 +83,8 @@ plugins_json_shape() {
           and all(.cached_plugins[]; (.name | type == "string") and (.source | type == "string")))
     and all(.installed[]; (.name | type == "string") and (.source_url | type == "string")
           and (.installed_commit | test("^[0-9a-f]{40}$")) and (.installed_at | type == "string")
-          and (.setup_status.state == "not_required"))
+          and (.setup_status.state == "not_required" or .setup_status.state == "succeeded")
+          and (.source_subdir == null or (.source_subdir | type == "string")))
   ' "$1"
 }
 mcp_json_shape() {
@@ -77,7 +104,12 @@ check "all repo agents installed" test "$(ls "$B/agents" | wc -l)" = "$(ls "$REP
 check "agent copied verbatim" cmp "$REPO/agents/spike.md" "$B/agents/spike.md"
 check "plugins.json valid + schema-shaped" plugins_json_shape "$B/plugins.json"
 check "plugins.json marketplace linked" jq -e '.marketplaces[0].name == "synaps-overclocked" and all(.installed[]; .marketplace == "synaps-overclocked")' "$B/plugins.json"
-check "plugins.json trusted host" jq -e '.trusted_hosts == ["github.com/HaseebKhalid1507"]' "$B/plugins.json"
+check "plugins.json trusted hosts" jq -e '.trusted_hosts == ["github.com/HaseebKhalid1507","github.com/maha-media"]' "$B/plugins.json"
+check "tmux-tools copied from its subdir" test -f "$B/plugins/tmux-tools/skills/tmux/SKILL.md"
+check "tmux-tools is not a git checkout" test ! -e "$B/plugins/tmux-tools/.git"
+check "tmux-tools recorded like /plugins" jq -e '.installed[] | select(.name == "tmux-tools") | .source_url == "https://github.com/maha-media/synaps-skills.git" and .source_subdir == "tmux-tools-plugin" and (.installed_commit | test("^[0-9a-f]{40}$"))' "$B/plugins.json"
+check "crush skipped without cargo" grep -q "crush: skipped, needs 'cargo'" <<<"$out"
+check "crush not installed" test ! -e "$B/plugins/crush"
 check "mcp.json valid + shaped" mcp_json_shape "$B/mcp.json"
 check "mcp.json paths templated" jq -e --arg b "$B" '.mcpServers["context-mode"] | .args[0] == "\($b)/overclocked/context-mode/server.bundle.mjs" and .env.CONTEXT_MODE_DIR == "\($b)/context-mode" and .env.CLAUDE_CONFIG_DIR == "\($b)/context-mode-shim"' "$B/mcp.json"
 for s in gauntlet-loop last30days; do
@@ -147,7 +179,7 @@ check "symlink untouched" test "$(readlink "$B/plugins/chronos")" = "$target"
 check "symlinked agent untouched" test "$(readlink "$B/agents/zero.md")" = "$target/.synaps-plugin/plugin.json"
 check "reported as skipped" grep -q "chronos: skipped, .* (symlink → $target)" <<<"$out"
 check "no plugins.json entry for chronos" jq -e 'all(.installed[]; .name != "chronos")' "$B/plugins.json"
-check "other plugins installed" jq -e '[.installed[].name] == ["agent-comms","synaps-dash"]' "$B/plugins.json"
+check "other plugins installed" jq -e '[.installed[].name] | index("agent-comms") != null and index("synaps-dash") != null and index("tmux-tools") != null' "$B/plugins.json"
 check "status says foreign" grep -q "chronos: skipped (foreign) symlink" <<<"$(oc status)"
 out="$(oc install --reclone 2>&1)"; rc=$?
 check "--reclone exit 0" test "$rc" = 0
@@ -159,7 +191,7 @@ out="$(oc install --replace-foreign 2>&1)"; rc=$?
 check "--replace-foreign exit 0" test "$rc" = 0
 bk="$(ls -d "$B"/overclocked/backups/*/plugins/chronos 2>/dev/null | head -n1)"
 check "--replace-foreign moved symlink into backups/" test "$(readlink "$bk")" = "$target"
-check "nothing but plugins left in plugins/" test "$(ls "$B/plugins" | tr '\n' ' ')" = "agent-comms chronos synaps-dash "
+check "nothing but plugins left in plugins/" test -z "$(ls "$B/plugins" | grep -vxF "$ALL_PLUGINS")"
 check "--replace-foreign cloned chronos" test -d "$B/plugins/chronos/.git"
 check "--replace-foreign recorded chronos" jq -e 'any(.installed[]; .name == "chronos")' "$B/plugins.json"
 check "--replace-foreign backed up plugins.json" bash -c "ls '$B'/overclocked/backups/*/plugins.json >/dev/null"
@@ -194,7 +226,7 @@ check "timestamped backup equals original" test "$(cat "$bk")" = "$orig"
 new_home; mkdir -p "$B"
 echo '{"mcpServers":{"context-mode":{"command":"node","args":["/elsewhere/server.bundle.mjs"]}}}' >"$B/mcp.json"
 mkdir -p "$B/plugins" "$B/agents" "$B/skills"
-for p in agent-comms chronos synaps-dash; do ln -s /nonexistent "$B/plugins/$p"; done
+for p in $ALL_PLUGINS; do ln -s /nonexistent "$B/plugins/$p"; done
 out="$(oc install 2>&1)"
 check "foreign context-mode entry kept" jq -e '.mcpServers["context-mode"].args == ["/elsewhere/server.bundle.mjs"]' "$B/mcp.json"
 check "foreign entry reported" grep -q "different 'context-mode' server is already configured" <<<"$out"
@@ -227,7 +259,7 @@ new="$(lock '.skills["gauntlet-loop"].commit')"
 fork="$(tmpd)"
 cp -r "$REPO/." "$fork/"; rm -rf "$fork/.git"
 jq --arg c "$old" '.skills["gauntlet-loop"].commit = $c' "$LOCK" >"$fork/skills.lock.json"
-mkdir -p "$B/plugins"; for p in agent-comms chronos synaps-dash; do ln -s /nonexistent "$B/plugins/$p"; done
+mkdir -p "$B/plugins"; for p in $ALL_PLUGINS; do ln -s /nonexistent "$B/plugins/$p"; done
 "$fork/overclock" install >/dev/null 2>&1
 check "old pin installed" test "$(head -n1 "$B/skills/gauntlet-loop/.SOURCE_COMMIT")" = "$old"
 check "status flags update" grep -q "gauntlet-loop: installed @ f2c462e pinned 9b1975a \[update available\]" <<<"$(oc status)"
@@ -242,7 +274,8 @@ oc update >/dev/null 2>&1
 check "second update leaves skills alone" test "$before" = "$(tree_hash "$B/skills")"
 
 # ======================================================================
-# offline fixtures: local file:// upstreams for the 3 plugins, a fork of this
+# offline fixtures: local file:// upstreams for the plugins (plus a multi-plugin
+# repo for the subdir plugin and a stub-built crush), a fork of this
 # repo whose marketplace points at them, and skills/context-mode pre-made as
 # foreign symlinks so these cases never touch the network.
 # ======================================================================
@@ -266,9 +299,36 @@ up_head() { git -C "$UP/$1.git" rev-parse main; }
 mk_upstream agent-comms ./bin/agent     # path command: relative to plugin dir, not a PATH lookup
 mk_upstream chronos python3
 mk_upstream synaps-dash bun
+mk_upstream heartbeat python3
+printf 'config\n' >"$UP/heartbeat-work/.gitignore"   # user settings stay untracked (see its README)
+git -C "$UP/heartbeat-work" add -A; git -C "$UP/heartbeat-work" commit -qm gitignore; git -C "$UP/heartbeat-work" push -q origin main
+mk_upstream d20 python3
+mk_upstream crush target/release/crush   # Rust plugin: built by `cargo build --release --locked`
+printf 'target/\n' >"$UP/crush-work/.gitignore"; echo '[package]' >"$UP/crush-work/Cargo.toml"; echo '# lock' >"$UP/crush-work/Cargo.lock"
+git -C "$UP/crush-work" add -A; git -C "$UP/crush-work" commit -qm cargo; git -C "$UP/crush-work" push -q origin main
+# a multi-plugin repo (like maha-media/synaps-skills); overclock takes one subdir of it
+mk_subdir_repo() {
+  local w="$UP/skills-repo-work"
+  git init -q -b main "$w"
+  mkdir -p "$w/tmux-tools-plugin/.synaps-plugin" "$w/tmux-tools-plugin/skills/tmux" "$w/tmux-tools-plugin/scripts" "$w/other-plugin"
+  echo '{"name":"tmux-tools","version":"0.2.1"}' >"$w/tmux-tools-plugin/.synaps-plugin/plugin.json"
+  printf -- '---\nname: tmux\ndescription: d\n---\nv1\n' >"$w/tmux-tools-plugin/skills/tmux/SKILL.md"
+  printf '#!/bin/sh\necho pane\n' >"$w/tmux-tools-plugin/scripts/pane.sh"; chmod +x "$w/tmux-tools-plugin/scripts/pane.sh"
+  echo other >"$w/other-plugin/README"; echo root >"$w/README.md"
+  git -C "$w" add -A; git -C "$w" commit -qm v1
+  git clone -q --bare "$w" "$UP/skills-repo.git"
+  git -C "$w" remote add origin "$UP/skills-repo.git"
+}
+mk_subdir_repo
+push_sub() { # <file under the repo> <line>
+  echo "$2" >>"$UP/skills-repo-work/$1"; git -C "$UP/skills-repo-work" add -A
+  git -C "$UP/skills-repo-work" commit -qm "$2"; git -C "$UP/skills-repo-work" push -q origin main
+}
+LIVE_OFFLINE="agent-comms chronos d20 heartbeat synaps-dash tmux-tools "   # crush needs cargo; PATH has none
 FORK="$(tmpd)"
 cp -R "$REPO/." "$FORK/"; rm -rf "$FORK/.git"
 jq --arg u "$UP" '.plugins |= map(.source = "file://\($u)/\(.name).git")' "$REPO/.synaps-plugin/marketplace.json" >"$FORK/.synaps-plugin/marketplace.json"
+jq --arg u "$UP" '.plugins |= map(.source = "file://\($u)/skills-repo.git")' "$REPO/subdir-plugins.json" >"$FORK/subdir-plugins.json"
 ocf() { guard_base "$SYNAPS_BASE_DIR"; "$FORK/overclock" "$@"; }
 offline_home() {
   new_home
@@ -310,12 +370,12 @@ check "update --reclone exit 0" test "$rc" = 0
 check "recloned onto rewritten upstream" test "$(git -C "$B/plugins/chronos" rev-parse HEAD)" = "$(up_head chronos)"
 check "plugins.json commit follows" test "$(pj_commit "$B/plugins.json" chronos)" = "$(up_head chronos)"
 check "old copy in backups/" test "$(git -C "$(ls -d "$B"/overclocked/backups/*/plugins/chronos | head -n1)" rev-parse HEAD)" = "$before"
-check "plugins/ holds only live plugins" test "$(ls -A "$B/plugins" | tr '\n' ' ')" = "agent-comms chronos synaps-dash "
+check "plugins/ holds only live plugins" test "$(ls -A "$B/plugins" | tr '\n' ' ')" = "$LIVE_OFFLINE"
 n_bk="$(ls -d "$B"/overclocked/backups/*/plugins/chronos* | wc -l)"
 out="$(ocf install --force 2>&1)"; rc=$?
 check "--force prints a deprecation notice" grep -q "force is deprecated; it now means --reclone" <<<"$out"
 check "--force (= --reclone) reclones owned plugins" test "$(ls -d "$B"/overclocked/backups/*/plugins/chronos* | wc -l)" -gt "$n_bk"
-check "--force leaves only live plugins" test "$(ls -A "$B/plugins" | tr '\n' ' ')" = "agent-comms chronos synaps-dash "
+check "--force leaves only live plugins" test "$(ls -A "$B/plugins" | tr '\n' ' ')" = "$LIVE_OFFLINE"
 
 # ======================================================================
 start "orphaned clone is adopted"
@@ -347,7 +407,7 @@ start "--profile / SYNAPS_PROFILE"
 offline_home
 out="$(SYNAPS_PROFILE=work ocf install 2>&1)"; rc=$?
 check "exit 0" test "$rc" = 0
-check "plugins.json written to profile dir" jq -e '[.installed[].name] | sort == ["agent-comms","chronos","synaps-dash"]' "$B/work/plugins.json"
+check "plugins.json written to profile dir" jq -e '[.installed[].name] | sort == ["agent-comms","chronos","d20","heartbeat","synaps-dash","tmux-tools"]' "$B/work/plugins.json"
 check "no base plugins.json" test ! -e "$B/plugins.json"
 check "plugins still in base plugins/" test -d "$B/plugins/chronos/.git"
 check "--profile flag sees the same state" grep -q "chronos: installed @ .* (plugins.json: [0-9a-f]\{7\};" <<<"$(ocf status --profile work)"
@@ -471,6 +531,200 @@ check "removed/ holds the plugins" test -d "$(ls -d "$B"/overclocked/removed/*/p
 check "status after uninstall: missing" grep -q "chronos: missing" <<<"$(ocf status)"
 out="$(ocf install 2>&1)"; rc=$?
 check "reinstall after uninstall works" test -d "$B/plugins/chronos/.git"
+
+# ======================================================================
+start "heartbeat + d20 install, update and uninstall like the others"
+offline_home
+out="$(ocf install 2>&1)"; rc=$?
+check "exit 0" test "$rc" = 0
+for p in heartbeat d20; do
+  check "$p cloned" test -d "$B/plugins/$p/.git"
+  check "$p commit == upstream" test "$(git -C "$B/plugins/$p" rev-parse HEAD)" = "$(up_head "$p")"
+  check "$p plugins.json entry" jq -e --arg n "$p" --arg u "file://$UP/$p.git" '.installed[] | select(.name == $n) | .source_url == $u and .marketplace == "synaps-overclocked" and .source_subdir == null and .setup_status == {state:"not_required"}' "$B/plugins.json"
+  check "status: $p installed" grep -q "$p: installed @ [0-9a-f]\{7\} (plugins.json: [0-9a-f]\{7\}; unpinned, tracks HEAD)" <<<"$(ocf status)"
+done
+check "plugins.json schema-shaped" plugins_json_shape "$B/plugins.json"
+printf 'max_beats = 3\n' >"$B/plugins/heartbeat/config"   # the user's own settings (gitignored upstream)
+push_commit heartbeat v2
+out="$(ocf update 2>&1)"; rc=$?
+check "update exit 0" test "$rc" = 0
+check "heartbeat fast-forwards past a local config" test "$(git -C "$B/plugins/heartbeat" rev-parse HEAD)" = "$(up_head heartbeat)"
+check "local config kept" grep -q "max_beats = 3" "$B/plugins/heartbeat/config"
+check "plugins.json commit bumped" test "$(pj_commit "$B/plugins.json" heartbeat)" = "$(up_head heartbeat)"
+check "d20 up to date" grep -q "d20: up to date" <<<"$out"
+out="$(ocf uninstall 2>&1)"; rc=$?
+check "uninstall exit 0" test "$rc" = 0
+check "heartbeat and d20 moved out" test ! -e "$B/plugins/heartbeat" -a ! -e "$B/plugins/d20"
+check "their entries are gone" jq -e 'all(.installed[]; .name != "heartbeat" and .name != "d20")' "$B/plugins.json"
+check "removed/ holds heartbeat with its config" test -f "$(ls -d "$B"/overclocked/removed/*/plugins/heartbeat | head -n1)/config"
+
+# ======================================================================
+start "subdir plugin (tmux-tools): install like /plugins"
+offline_home
+before_up="$(git -C "$UP/skills-repo.git" rev-parse main)"
+out="$(ocf install --dry-run 2>&1)"; rc=$?
+check "dry-run exit 0" test "$rc" = 0
+check "dry-run names the sparse copy" grep -q "\[dry-run\] sparse clone --depth=1 file://$UP/skills-repo.git, copy tmux-tools-plugin/ -> $B/plugins/tmux-tools" <<<"$out"
+check "dry-run wrote nothing" test ! -e "$B/plugins"
+out="$(ocf install 2>&1)"; rc=$?
+check "exit 0" test "$rc" = 0
+T="$B/plugins/tmux-tools"
+check "subdir content copied" test -f "$T/skills/tmux/SKILL.md" -a -f "$T/.synaps-plugin/plugin.json"
+check "exec bit kept" test -x "$T/scripts/pane.sh"
+check "no .git in the plugin dir" test ! -e "$T/.git"
+check "nothing else from the repo" test ! -e "$T/other-plugin" -a ! -e "$T/README.md" -a ! -e "$T/tmux-tools-plugin"
+check "plugins.json entry like a /plugins subdir install" jq -e --arg u "file://$UP/skills-repo.git" --arg c "$before_up" \
+  '.installed[] | select(.name == "tmux-tools") | .source_url == $u and .source_subdir == "tmux-tools-plugin" and .installed_commit == $c and .setup_status == {state:"not_required"} and .checksum_value == null' "$B/plugins.json"
+check "state.json records subdir + content hash" jq -e --arg c "$before_up" '.items["plugin:tmux-tools"] | .subdir == "tmux-tools-plugin" and .commit == $c and (.tree | test("^[0-9a-f]{64}$"))' "$B/overclocked/state.json"
+check "plugins.json schema-shaped" plugins_json_shape "$B/plugins.json"
+check "status shows subdir" grep -q "tmux-tools: installed @ $(short "$before_up") (plugins.json: $(short "$before_up"); tmux-tools-plugin/ of file://$UP/skills-repo.git, tracks HEAD)" <<<"$(ocf status)"
+check "no scratch dir left" bash -c "! ls -d '$B'/overclocked/.tmp.* 2>/dev/null"
+before="$(tree_hash "$B")"
+out="$(ocf install 2>&1)"
+check "rerun is a no-op" test "$before" = "$(tree_hash "$B")"
+check "rerun reports installed" grep -q "tmux-tools: installed @ $(short "$before_up")" <<<"$out"
+
+start "subdir plugin: update"
+out="$(ocf update 2>&1)"
+check "unchanged upstream: up to date" grep -q "tmux-tools: up to date @ $(short "$before_up")" <<<"$out"
+at1="$(jq -r '.installed[] | select(.name == "tmux-tools") | .installed_at' "$B/plugins.json")"
+push_sub tmux-tools-plugin/skills/tmux/SKILL.md v2
+out="$(ocf update 2>&1)"; rc=$?
+check "update exit 0" test "$rc" = 0
+check "new content copied" grep -q v2 "$T/skills/tmux/SKILL.md"
+check "plugins.json commit bumped" test "$(pj_commit "$B/plugins.json" tmux-tools)" = "$(up_head skills-repo)"
+check "installed_at kept" test "$(jq -r '.installed[] | select(.name == "tmux-tools") | .installed_at' "$B/plugins.json")" = "$at1"
+check "state.json commit bumped" jq -e --arg c "$(up_head skills-repo)" '.items["plugin:tmux-tools"].commit == $c' "$B/overclocked/state.json"
+check "old copy in backups/" bash -c "! grep -q v2 '$(ls -d "$B"/overclocked/backups/*/plugins/tmux-tools | head -n1)/skills/tmux/SKILL.md'"
+check "plugins/ holds only live plugins" test "$(ls -A "$B/plugins" | tr '\n' ' ')" = "$LIVE_OFFLINE"
+push_sub other-plugin/README unrelated
+out="$(ocf update 2>&1)"
+check "commit outside the subdir still bumps the commit" test "$(pj_commit "$B/plugins.json" tmux-tools)" = "$(up_head skills-repo)"
+echo "my edit" >>"$T/skills/tmux/SKILL.md"
+push_sub tmux-tools-plugin/skills/tmux/SKILL.md v3
+cur="$(pj_commit "$B/plugins.json" tmux-tools)"
+out="$(ocf update 2>&1)"
+check "local edit blocks update" grep -q "tmux-tools: local changes, not updating (use --reclone to replace it)" <<<"$out"
+check "local edit kept" grep -q "my edit" "$T/skills/tmux/SKILL.md"
+check "commit unchanged" test "$(pj_commit "$B/plugins.json" tmux-tools)" = "$cur"
+out="$(ocf update --reclone 2>&1)"; rc=$?
+check "update --reclone exit 0" test "$rc" = 0
+check "--reclone took upstream" grep -q v3 "$T/skills/tmux/SKILL.md"
+check "--reclone dropped the edit from plugins/" bash -c "! grep -q 'my edit' '$T/skills/tmux/SKILL.md'"
+check "edited copy kept in backups/" bash -c "grep -lq 'my edit' '$B'/overclocked/backups/*/plugins/tmux-tools*/skills/tmux/SKILL.md"
+
+start "subdir plugin: uninstall"
+out="$(ocf uninstall 2>&1)"; rc=$?
+check "exit 0" test "$rc" = 0
+check "moved out of plugins/" test ! -e "$T"
+check "entry gone" jq -e 'all(.installed[]; .name != "tmux-tools")' "$B/plugins.json"
+check "removed/ holds it" test -f "$(ls -d "$B"/overclocked/removed/*/plugins/tmux-tools | head -n1)/skills/tmux/SKILL.md"
+
+# ======================================================================
+start "subdir plugin: adopting a /plugins install"
+offline_home
+c="$(up_head skills-repo)"
+w="$(tmpd)"; git clone -q "file://$UP/skills-repo.git" "$w/r"
+mkdir -p "$B/plugins"; cp -Rp "$w/r/tmux-tools-plugin" "$B/plugins/tmux-tools"
+jq -n --arg u "file://$UP/skills-repo.git" --arg c "$c" '{marketplaces:[], trusted_hosts:[], installed:[{name:"tmux-tools", marketplace:"synaps-skills", source_url:$u, installed_commit:$c,
+  latest_commit:null, installed_at:"2026-01-01T00:00:00+00:00", source_subdir:"tmux-tools-plugin", checksum_algorithm:null, checksum_value:null, setup_status:{state:"not_required"}}]}' >"$B/plugins.json"
+push_sub tmux-tools-plugin/skills/tmux/SKILL.md v4    # upstream moved on since that install
+out="$(ocf install 2>&1)"; rc=$?
+check "exit 0" test "$rc" = 0
+check "adopted at its recorded commit" grep -q "tmux-tools: adopted existing install (tmux-tools-plugin/ @ $(short "$c"))" <<<"$out"
+check "recorded in state.json" jq -e --arg c "$c" '.items["plugin:tmux-tools"].commit == $c' "$B/overclocked/state.json"
+check "existing plugins.json entry kept" jq -e '[.installed[] | select(.name == "tmux-tools")] | length == 1 and .[0].marketplace == "synaps-skills"' "$B/plugins.json"
+check "plugin dir not replaced" bash -c "! ls -d '$B'/overclocked/backups/*/plugins/tmux-tools 2>/dev/null"
+offline_home
+mkdir -p "$B/plugins"; cp -Rp "$w/r/tmux-tools-plugin" "$B/plugins/tmux-tools"; echo hacked >>"$B/plugins/tmux-tools/scripts/pane.sh"
+jq -n --arg u "file://$UP/skills-repo.git" --arg c "$c" '{installed:[{name:"tmux-tools", source_url:$u, installed_commit:$c, installed_at:"x", source_subdir:"tmux-tools-plugin"}]}' >"$B/plugins.json"
+out="$(ocf install 2>&1)"
+check "modified copy is foreign" grep -q "tmux-tools: skipped, $B/plugins/tmux-tools exists and is not managed by overclock" <<<"$out"
+check "modified copy untouched" grep -q hacked "$B/plugins/tmux-tools/scripts/pane.sh"
+
+# ======================================================================
+start "subdir plugin: missing subdir upstream"
+offline_home
+FORK2="$(tmpd)"; cp -R "$FORK/." "$FORK2/"
+jq '.plugins[0].subdir = "no-such-plugin"' "$FORK/subdir-plugins.json" >"$FORK2/subdir-plugins.json"
+out="$("$FORK2/overclock" install 2>&1)"; rc=$?
+check "exit 0" test "$rc" = 0
+check "warned" grep -q "tmux-tools: fetching no-such-plugin from .* failed: subdir 'no-such-plugin' not found" <<<"$out"
+check "not installed" test ! -e "$B/plugins/tmux-tools"
+check "not registered" jq -e 'all(.installed[]; .name != "tmux-tools")' "$B/plugins.json"
+jq '.plugins[0].subdir = "../evil"' "$FORK/subdir-plugins.json" >"$FORK2/subdir-plugins.json"
+out="$("$FORK2/overclock" install 2>&1)"
+check "unsafe subdir refused" grep -q "tmux-tools: unsafe subdir '../evil'" <<<"$out"
+
+# ======================================================================
+start "crush: skipped without cargo"
+offline_home
+out="$(ocf install 2>&1)"; rc=$?
+check "exit 0" test "$rc" = 0
+check "clear warning" grep -q "crush: skipped, needs 'cargo' which is not installed (it is built from source; install the Rust toolchain" <<<"$out"
+check "not cloned" test ! -e "$B/plugins/crush"
+check "not registered" jq -e 'all(.installed[]; .name != "crush")' "$B/plugins.json"
+check "status: missing" grep -q "crush: missing" <<<"$(ocf status)"
+
+start "crush: built with cargo"
+offline_home
+: >"$CARGO_STUB_LOG"
+out="$(with_cargo ocf install 2>&1)"; rc=$?
+check "exit 0" test "$rc" = 0
+check "cargo build --release --locked ran once" test "$(cat "$CARGO_STUB_LOG" | wc -l)" = 1
+check "with --locked" grep -q '|build --release --locked$' "$CARGO_STUB_LOG"
+check "built before the swap (in scratch, not plugins/)" bash -c "grep -q '/overclocked/.tmp\.' '$CARGO_STUB_LOG'"
+check "binary in place" test -x "$B/plugins/crush/target/release/crush"
+check "clone is pristine (target/ ignored)" test -z "$(git -C "$B/plugins/crush" status --porcelain)"
+log="$(jq -r '.installed[] | select(.name == "crush") | .setup_status.log_path' "$B/plugins.json")"
+check "setup_status succeeded like /plugins" jq -e '.installed[] | select(.name == "crush") | .setup_status.state == "succeeded"' "$B/plugins.json"
+check "build log exists" test -f "$log"
+check "plugins.json schema-shaped" plugins_json_shape "$B/plugins.json"
+check "status: built" grep -q "crush: installed @ [0-9a-f]\{7\} (plugins.json: [0-9a-f]\{7\}; unpinned, tracks HEAD; built)" <<<"$(ocf status)"
+before="$(tree_hash "$B")"
+with_cargo ocf install >/dev/null 2>&1
+check "rerun does not rebuild" test "$(cat "$CARGO_STUB_LOG" | wc -l)" = 1
+check "rerun is a no-op" test "$before" = "$(tree_hash "$B")"
+push_commit crush v2
+out="$(with_cargo ocf update 2>&1)"; rc=$?
+check "update exit 0" test "$rc" = 0
+check "update rebuilt in place" test "$(tail -n1 "$CARGO_STUB_LOG" | cut -d'|' -f1)" = "$B/plugins/crush"
+check "update fast-forwarded" test "$(git -C "$B/plugins/crush" rev-parse HEAD)" = "$(up_head crush)"
+check "plugins.json commit bumped" test "$(pj_commit "$B/plugins.json" crush)" = "$(up_head crush)"
+check "setup_status still succeeded" jq -e '.installed[] | select(.name == "crush") | .setup_status.state == "succeeded"' "$B/plugins.json"
+
+start "crush: failed rebuild on update rolls back"
+good="$(git -C "$B/plugins/crush" rev-parse HEAD)"
+push_commit crush v3
+out="$(CARGO_STUB_FAIL=1 with_cargo ocf update 2>&1)"; rc=$?
+check "update exit 0" test "$rc" = 0
+check "build error shown" grep -q "crush: cargo build failed: .*stub build failure" <<<"$out"
+check "rollback reported" grep -q "crush: rebuild failed; source reset to $(short "$good")" <<<"$out"
+check "source back at the old commit" test "$(git -C "$B/plugins/crush" rev-parse HEAD)" = "$good"
+check "old binary still there" test -x "$B/plugins/crush/target/release/crush"
+check "plugins.json commit unchanged" test "$(pj_commit "$B/plugins.json" crush)" = "$good"
+out="$(ocf update 2>&1)"
+check "update without cargo leaves crush alone" grep -q "crush: not updating, needs 'cargo' to rebuild it" <<<"$out"
+check "still at the old commit" test "$(git -C "$B/plugins/crush" rev-parse HEAD)" = "$good"
+out="$(with_cargo ocf update 2>&1)"
+check "next update with cargo catches up" test "$(pj_commit "$B/plugins.json" crush)" = "$(up_head crush)"
+out="$(ocf uninstall 2>&1)"
+check "uninstall moves crush out" test ! -e "$B/plugins/crush"
+check "uninstall drops its entry" jq -e 'all(.installed[]; .name != "crush")' "$B/plugins.json"
+
+start "crush: failed build on install registers nothing"
+offline_home
+out="$(CARGO_STUB_FAIL=1 with_cargo ocf install 2>&1)"; rc=$?
+check "exit 0" test "$rc" = 0
+check "build failure reported" grep -q "crush: cargo build failed" <<<"$out"
+check "not installed" grep -q "crush: not installed" <<<"$out"
+check "nothing in plugins/" test ! -e "$B/plugins/crush"
+check "not registered" jq -e 'all(.installed[]; .name != "crush")' "$B/plugins.json"
+check "not in state.json" jq -e '.items["plugin:crush"] == null' "$B/overclocked/state.json"
+check "no scratch dir left" bash -c "! ls -d '$B'/overclocked/.tmp.* 2>/dev/null"
+mkdir -p "$B/plugins"; ln -s /nonexistent-crush "$B/plugins/crush"
+out="$(CARGO_STUB_FAIL=1 with_cargo ocf install --replace-foreign 2>&1)"
+check "--replace-foreign + failed build keeps the foreign item" test "$(readlink "$B/plugins/crush")" = /nonexistent-crush
 
 # full (network) install from the first case
 HOME="$FRESH_HOME" SYNAPS_BASE_DIR="$FRESH_B"; export HOME SYNAPS_BASE_DIR; B="$FRESH_B"

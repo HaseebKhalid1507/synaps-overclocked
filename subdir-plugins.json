@@ -1,0 +1,13 @@
+{
+  "description": "Plugins overclock installs from a subdirectory of someone else's repo. The /plugins marketplace schema only allows ./<subdir> sources inside the marketplace's own repo, so these are not listed in .synaps-plugin/marketplace.json. overclock installs them the way /plugins installs a ./<subdir> plugin from that repo's own marketplace: shallow clone, copy <subdir> into plugins/<name>, record source_url + source_subdir. Tracks HEAD.",
+  "plugins": [
+    {
+      "name": "tmux-tools",
+      "source": "https://github.com/maha-media/synaps-skills.git",
+      "subdir": "tmux-tools-plugin",
+      "version": "0.2.1",
+      "description": "Worker-pane patterns for agents inside tmux (JR Morton, maha-media/synaps-skills).",
+      "license": "MIT"
+    }
+  ]
+}

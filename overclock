@@ -9,6 +9,7 @@ MARKETPLACE_NAME="synaps-overclocked"
 MARKETPLACE_REPO="https://github.com/HaseebKhalid1507/synaps-overclocked"
 MARKETPLACE_URL="https://raw.githubusercontent.com/HaseebKhalid1507/synaps-overclocked/HEAD/.synaps-plugin/marketplace.json"
 MANIFEST="$SELF_DIR/.synaps-plugin/marketplace.json"
+SUBDIR_PLUGINS="$SELF_DIR/subdir-plugins.json"
 LOCK="$SELF_DIR/skills.lock.json"
 MCP_TEMPLATE="$SELF_DIR/mcp/context-mode.json"
 
@@ -69,7 +70,8 @@ done
 if [ "$(id -u)" -eq 0 ]; then die "refusing to run as root"; fi
 command -v git >/dev/null 2>&1 || die "git is required"
 command -v jq  >/dev/null 2>&1 || die "jq is required"
-[ -f "$MANIFEST" ] && [ -f "$LOCK" ] && [ -f "$MCP_TEMPLATE" ] || die "run overclock from a synaps-overclocked checkout ($SELF_DIR is incomplete)"
+export GIT_TERMINAL_PROMPT=0   # a missing/private repo must fail, not prompt for credentials
+[ -f "$MANIFEST" ] && [ -f "$SUBDIR_PLUGINS" ] && [ -f "$LOCK" ] && [ -f "$MCP_TEMPLATE" ] || die "run overclock from a synaps-overclocked checkout ($SELF_DIR is incomplete)"
 
 if [ -n "${SYNAPS_BASE_DIR:-}" ]; then BASE="$SYNAPS_BASE_DIR"
 elif [ -n "${HOME:-}" ]; then BASE="$HOME/.synaps-cli"
@@ -226,7 +228,7 @@ validate_json_files() {
 
 check_runtimes() {
   local r
-  for r in python3 bun node; do
+  for r in python3 bun node cargo; do
     have "$r" || warn "$r not found: items that need it will be skipped"
   done
 }
@@ -252,10 +254,23 @@ tmpdir() { [ -n "$TMPROOT" ] || die "internal: scratch dir not initialised"; mkt
 # ======================================================================
 # plugins
 # ======================================================================
-PLUGIN_NAMES=() ; while IFS= read -r n; do PLUGIN_NAMES+=("$n"); done < <(jq -r '.plugins[].name' "$MANIFEST")
-plugin_src() { jq -r --arg n "$1" '.plugins[] | select(.name == $n) | .source' "$MANIFEST"; }
-# runtime known before cloning (each plugin repo's manifest declares it)
-plugin_runtime_static() { case "$1" in synaps-dash) echo bun ;; *) echo python3 ;; esac; }
+# Two sources: whole-repo plugins from .synaps-plugin/marketplace.json, and plugins that
+# live in a subdirectory of someone else's repo (subdir-plugins.json).
+PLUGIN_NAMES=() ; while IFS= read -r n; do PLUGIN_NAMES+=("$n"); done < <(jq -r '.plugins[].name' "$MANIFEST" "$SUBDIR_PLUGINS")
+plugin_field() { jq -rn --arg n "$1" --arg f "$2" '[inputs.plugins[] | select(.name == $n) | .[$f] // empty][0] // empty' "$MANIFEST" "$SUBDIR_PLUGINS"; }
+plugin_src() { plugin_field "$1" source; }
+plugin_subdir() { plugin_field "$1" subdir; }
+# What a plugin needs before it is worth cloning. The plugin repos' manifests declare
+# python3/bun; crush is a Rust binary that has to be built; tmux-tools is skills only.
+plugin_needs() { case "$1" in synaps-dash) echo bun ;; crush) echo cargo ;; tmux-tools) echo "" ;; *) echo python3 ;; esac; }
+plugin_builds() { [ "$(plugin_needs "$1")" = cargo ]; }
+need_hint() { case "$1" in cargo) printf ' (it is built from source; install the Rust toolchain: https://rustup.rs)' ;; esac; }
+# Same rule as the native installer (marketplace.rs is_safe_plugin_name): one path component.
+safe_subdir() { printf '%s' "$1" | grep -Eq '^[A-Za-z0-9_-]{1,64}$'; }
+# A plugin dir overclock manages: a git clone, or (subdir plugins) a plain copied dir.
+# HEAD of a cloned plugin; the recorded commit for a copied subdir plugin.
+plugin_commit() { if [ -n "$(plugin_subdir "$1")" ]; then state_json | jq -r --arg k "plugin:$1" '.items[$k].commit // empty'; else head_of "$2"; fi; }
+managed_dir() { [ ! -L "$2" ] || return 1; if [ -n "$(plugin_subdir "$1")" ]; then [ -d "$2" ]; else [ -d "$2/.git" ]; fi; }
 
 # extension.command from the cloned manifest. Bare names must be on PATH;
 # paths are relative to the plugin dir (post_install.rs verify_extension_command).
@@ -275,55 +290,145 @@ origin_matches() { # <dir> <source url>
   u="$(gitq "$1" remote get-url origin 2>/dev/null)" || return 1
   [ "$(norm_url "$u")" = "$(norm_url "$2")" ]
 }
-plugin_state() { # <name> <path> <commit>
-  jq -n --arg p "$2" --arg c "$3" --arg s "$(plugin_src "$1")" --arg t "$NOW" '{path:$p,commit:$c,source:$s,installed_at:$t}'
+plugin_state() { # <name> <path> <commit> [extra json merged in]
+  local x="${4:-}"; [ -n "$x" ] || x='{}'
+  jq -n --arg p "$2" --arg c "$3" --arg s "$(plugin_src "$1")" --arg t "$NOW" --argjson x "$x" \
+    '{path:$p,commit:$c,source:$s,installed_at:$t} + $x'
 }
+
+# Content hash of a copied (non-git) plugin dir: paths, contents, exec bits, link targets.
+# Recorded at install so update can tell local edits apart from upstream changes.
+tree_sum() {
+  ( cd "$1" && find . \( -type f -o -type l \) -print | LC_ALL=C sort | while IFS= read -r f; do
+      if [ -L "$f" ]; then printf 'l %s %s\n' "$f" "$(readlink "$f")"
+      else printf 'f %s %s %s\n' "$f" "$([ -x "$f" ] && echo x || echo -)" "$(sha256 <"$f")"; fi
+    done ) | sha256
+}
+
+# Subdir plugin, mirroring install.rs install_plugin_from_subdir (shallow clone of the
+# repo, then <subdir> moved into place) but sparse: only <subdir> is checked out.
+# <work>/src is the checkout, <work>/out the plugin dir. <ref> is HEAD or a commit.
+stage_subdir() { # <src> <subdir> <ref> <work>
+  safe_subdir "$2" || { echo "unsafe subdir name: $2"; return 1; }
+  git init -q "$4/src" &&
+    git -C "$4/src" remote add origin "$1" &&
+    git -C "$4/src" config core.sparseCheckout true &&
+    printf '/%s/\n' "$2" >"$4/src/.git/info/sparse-checkout" &&
+    git -C "$4/src" fetch -q --depth=1 --filter=blob:none origin "$3" 2>&1 | grep -v 'filtering not recognized by server' >&2
+  [ "${PIPESTATUS[0]}" = 0 ] || return 1
+  git -C "$4/src" -c advice.detachedHead=false checkout -q FETCH_HEAD || return 1
+  if [ ! -d "$4/src/$2" ] || [ -L "$4/src/$2" ]; then echo "subdir '$2' not found in $1"; return 1; fi
+  mv "$4/src/$2" "$4/out"
+}
+
+# crush: cargo build --release --locked, then the manifest's command must exist.
+# Log goes to $OC_DIR/logs/; the path is recorded as setup_status like /plugins does.
+SETUP_LOG=""
+build_plugin() { # <name> <plugin dir>
+  local n="$1" d="$2" log cmd
+  if [ ! -f "$d/Cargo.lock" ]; then warn "$n: no Cargo.lock in the source; refusing an unlocked build"; return 1; fi
+  mkdir -p "$OC_DIR/logs"
+  log="$OC_DIR/logs/$n-$TS.log"
+  say "  … $n: cargo build --release --locked (log: $log)"
+  if ! (cd "$d" && cargo build --release --locked) >"$log" 2>&1; then
+    warn "$n: cargo build failed: $(tail -n 3 "$log" | tr '\n' ' ')"
+    warn "  full log: $log"
+    return 1
+  fi
+  cmd="$(jq -r '.extension.command // empty' "$d/.synaps-plugin/plugin.json" 2>/dev/null || true)"
+  case "$cmd" in
+    /*) warn "$n: extension.command is absolute ($cmd); not registering it"; return 1 ;;
+    */*) if [ ! -x "$d/$cmd" ]; then warn "$n: build finished but $cmd is missing or not executable (log: $log)"; return 1; fi ;;
+  esac
+  SETUP_LOG="$log"
+}
+setup_status_json() { if [ -n "$SETUP_LOG" ]; then jq -cn --arg l "$SETUP_LOG" '{state:"succeeded",log_path:$l}'; else echo '{"state":"not_required"}'; fi; }
 
 FRESH_PLUGINS=()   # (re)cloned or fast-forwarded this run -> commit refreshed in plugins.json
 OWNED_PLUGINS=()   # managed by overclock -> entry ensured in plugins.json
 
-# Fresh clone into scratch, then swap in. An owned old dir goes to backups;
+# Fresh clone (and build) into scratch, then swap in. An owned old dir goes to backups;
 # a foreign one (--replace-foreign) is displaced so uninstall can restore it.
+# Anything that fails before the swap leaves the existing dir alone.
 reclone_plugin() { # <name> [foreign]
-  local n="$1" dest="$PLUGINS_DIR/$1" foreign="${2:-}" src tmp sha err
-  src="$(plugin_src "$n")"
+  local n="$1" dest="$PLUGINS_DIR/$1" foreign="${2:-}" src sub need work tmp sha err extra
+  src="$(plugin_src "$n")"; sub="$(plugin_subdir "$n")"; need="$(plugin_needs "$n")"
+  if plugin_builds "$n" && ! have "$need"; then warn "$n: skipped, needs '$need' which is not installed$(need_hint "$need")"; return 1; fi
   if [ "$DRY" = 1 ]; then
     if exists "$dest"; then if [ -n "$foreign" ]; then displace "$dest"; else move_aside "$dest"; fi; fi
-    dry "git clone --depth=1 $src $dest"
-    dry "record $n in $PSTATE (marketplace $MARKETPLACE_NAME)"
+    if [ -n "$sub" ]; then dry "sparse clone --depth=1 $src, copy $sub/ -> $dest"
+    else dry "git clone --depth=1 $src $dest"; fi
+    if plugin_builds "$n"; then dry "(cd $dest && cargo build --release --locked)"; fi
+    dry "record $n in $PSTATE (marketplace $MARKETPLACE_NAME${sub:+, source_subdir $sub})"
     return 0
   fi
-  tmp="$(tmpdir)/$n"
-  if ! err="$(git clone -q --depth=1 "$src" "$tmp" 2>&1)"; then warn "$n: git clone failed: $err"; return 1; fi
-  sha="$(git -C "$tmp" rev-parse HEAD)"
+  work="$(tmpdir)"; SETUP_LOG=""
+  if [ -n "$sub" ]; then
+    if ! err="$(stage_subdir "$src" "$sub" HEAD "$work" 2>&1)"; then warn "$n: fetching $sub from $src failed: $err"; return 1; fi
+    tmp="$work/out"; sha="$(git -C "$work/src" rev-parse HEAD)"
+    extra="$(jq -cn --arg s "$sub" --arg h "$(tree_sum "$tmp")" '{subdir:$s, tree:$h}')"
+  else
+    tmp="$work/$n"
+    if ! err="$(git clone -q --depth=1 "$src" "$tmp" 2>&1)"; then warn "$n: git clone failed: $err"; return 1; fi
+    sha="$(git -C "$tmp" rev-parse HEAD)"
+    if plugin_builds "$n"; then build_plugin "$n" "$tmp" || { warn "$n: not installed"; return 1; }; fi
+    extra="$(jq -cn --argjson st "$(setup_status_json)" '{setup_status:$st}')"
+  fi
   plugin_command_ok "$n" "$tmp" || return 1
   mkdir -p "$PLUGINS_DIR"
   if exists "$dest"; then if [ -n "$foreign" ]; then displace "$dest"; else move_aside "$dest"; fi; fi
   mv "$tmp" "$dest"
-  state_set "plugin:$n" "$(plugin_state "$n" "$dest" "$sha")"
-  ok "$n: cloned @ $(short "$sha")"
+  state_set "plugin:$n" "$(plugin_state "$n" "$dest" "$sha" "$extra")"
+  ok "$n: $( [ -n "$sub" ] && echo "copied $sub/" || echo cloned) @ $(short "$sha")$( [ -n "$SETUP_LOG" ] && echo ", built")"
   FRESH_PLUGINS+=("$n")
+}
+
+# A subdir plugin installed by /plugins: plugins.json says it came from the same repo +
+# subdir, and its content is exactly that subdir at the recorded commit.
+adopt_subdir_plugin() { # <name> <dest> -> 0 if adopted
+  local n="$1" dest="$2" src sub row u c work
+  src="$(plugin_src "$n")"; sub="$(plugin_subdir "$n")"
+  [ -f "$PSTATE" ] && [ ! -L "$dest" ] && [ -d "$dest" ] || return 1
+  row="$(jq -r --arg n "$n" --arg s "$sub" '[.installed[]? | select(.name == $n and .source_subdir == $s)][0] // empty | "\(.source_url)\t\(.installed_commit)"' "$PSTATE" 2>/dev/null)"
+  [ -n "$row" ] || return 1
+  u="${row%%$'\t'*}"; c="${row#*$'\t'}"
+  [ "$(norm_url "$u")" = "$(norm_url "$src")" ] || return 1
+  printf '%s' "$c" | grep -Eq '^[0-9a-f]{40}$' || return 1
+  if [ "$DRY" = 1 ]; then dry "adopt $dest if it matches $sub/ of $src @ $(short "$c")"; return 0; fi
+  work="$(tmpdir)"
+  stage_subdir "$src" "$sub" "$c" "$work" >/dev/null 2>&1 || return 1
+  [ "$(tree_sum "$work/out")" = "$(tree_sum "$dest")" ] || return 1
+  state_set "plugin:$n" "$(plugin_state "$n" "$dest" "$c" "$(jq -cn --arg s "$sub" --arg h "$(tree_sum "$dest")" '{subdir:$s, tree:$h}')")"
+  ok "$n: adopted existing install ($sub/ @ $(short "$c"))"
 }
 
 install_plugins() {
   head1 "plugins → $PLUGINS_DIR"
-  local n dest src
+  local n dest src sub need
   for n in ${PLUGIN_NAMES[@]+"${PLUGIN_NAMES[@]}"}; do
-    dest="$PLUGINS_DIR/$n"; src="$(plugin_src "$n")"
-    # adopt: a real, clean clone of the same repo (interrupted run, or a /plugins TUI install)
-    if exists "$dest" && [ ! -L "$dest" ] && ! owned "plugin:$n" && origin_matches "$dest" "$src"; then
-      if is_pristine "$dest"; then
-        if [ "$DRY" = 1 ]; then dry "adopt $dest (origin matches $src, clean)"
-        else state_set "plugin:$n" "$(plugin_state "$n" "$dest" "$(head_of "$dest")")"; ok "$n: adopted existing clone @ $(short "$(head_of "$dest")")"; fi
-        OWNED_PLUGINS+=("$n")
-        [ "$RECLONE" = 1 ] || continue
-      else
-        skip "$n: $dest is a clone of $src with local changes or unpushed commits; treating it as foreign"
+    dest="$PLUGINS_DIR/$n"; src="$(plugin_src "$n")"; sub="$(plugin_subdir "$n")"; need="$(plugin_needs "$n")"
+    if [ -n "$sub" ] && ! safe_subdir "$sub"; then warn "$n: unsafe subdir '$sub' in subdir-plugins.json; skipped"; continue; fi
+    # adopt: a real, clean install of the same source (interrupted run, or a /plugins TUI install)
+    if exists "$dest" && [ ! -L "$dest" ] && ! owned "plugin:$n"; then
+      if [ -n "$sub" ]; then
+        if adopt_subdir_plugin "$n" "$dest"; then
+          OWNED_PLUGINS+=("$n")
+          [ "$RECLONE" = 1 ] || continue
+        fi
+      elif origin_matches "$dest" "$src"; then
+        if is_pristine "$dest"; then
+          if [ "$DRY" = 1 ]; then dry "adopt $dest (origin matches $src, clean)"
+          else state_set "plugin:$n" "$(plugin_state "$n" "$dest" "$(head_of "$dest")")"; ok "$n: adopted existing clone @ $(short "$(head_of "$dest")")"; fi
+          OWNED_PLUGINS+=("$n")
+          [ "$RECLONE" = 1 ] || continue
+        else
+          skip "$n: $dest is a clone of $src with local changes or unpushed commits; treating it as foreign"
+        fi
       fi
     fi
     if exists "$dest"; then
-      if [ ! -L "$dest" ] && owned "plugin:$n" && [ -d "$dest/.git" ]; then
-        if [ "$RECLONE" = 0 ]; then ok "$n: installed @ $(short "$(head_of "$dest")")"
+      if owned "plugin:$n" && managed_dir "$n" "$dest"; then
+        if [ "$RECLONE" = 0 ]; then ok "$n: installed @ $(short "$(plugin_commit "$n" "$dest")")"
         else reclone_plugin "$n" || true; fi
         in_list "$n" ${OWNED_PLUGINS[@]+"${OWNED_PLUGINS[@]}"} || OWNED_PLUGINS+=("$n")
         continue
@@ -333,7 +438,7 @@ install_plugins() {
         continue
       fi
     fi
-    if ! have "$(plugin_runtime_static "$n")"; then warn "$n: skipped, needs '$(plugin_runtime_static "$n")' which is not installed"; continue; fi
+    if [ -n "$need" ] && ! have "$need"; then warn "$n: skipped, needs '$need' which is not installed$(need_hint "$need")"; continue; fi
     if reclone_plugin "$n" foreign && [ "$DRY" = 0 ]; then OWNED_PLUGINS+=("$n"); fi
   done
 }
@@ -344,16 +449,19 @@ merge_plugins_json() {
   head1 "plugins.json → $PSTATE"
   if [ "${#OWNED_PLUGINS[@]}" -eq 0 ]; then skip "no managed plugins installed yet; leaving plugins.json alone"; return 0; fi
   if [ -L "$PSTATE" ]; then warn "$PSTATE is a symlink; not rewriting it (Synaps would lose the link). Register the plugins via /plugins instead."; return 0; fi
-  local cur new entries="[]" n sha fresh
+  local cur new entries="[]" n sha fresh setup
   cur="$( [ -f "$PSTATE" ] && cat "$PSTATE" || echo '{}')"
   for n in ${OWNED_PLUGINS[@]+"${OWNED_PLUGINS[@]}"}; do
-    sha="$(head_of "$PLUGINS_DIR/$n")"
+    sha="$(plugin_commit "$n" "$PLUGINS_DIR/$n")"
     [ -n "$sha" ] || continue
     if in_list "$n" ${FRESH_PLUGINS[@]+"${FRESH_PLUGINS[@]}"}; then fresh=true; else fresh=false; fi
-    entries="$(jq --arg n "$n" --arg m "$MARKETPLACE_NAME" --arg s "$(plugin_src "$n")" --arg c "$sha" --arg t "$NOW" --argjson fresh "$fresh" \
+    setup="$(state_json | jq -c --arg k "plugin:$n" '.items[$k].setup_status // {state:"not_required"}')"
+    # subdir plugins: source_url is the repo, source_subdir the dir inside it (state.rs InstalledPlugin)
+    entries="$(jq --arg n "$n" --arg m "$MARKETPLACE_NAME" --arg s "$(plugin_src "$n")" --arg sub "$(plugin_subdir "$n")" \
+      --arg c "$sha" --arg t "$NOW" --argjson fresh "$fresh" --argjson st "$setup" \
       '. + [{fresh:$fresh, entry:{name:$n, marketplace:$m, source_url:$s, installed_commit:$c, latest_commit:null,
-             installed_at:$t, source_subdir:null, checksum_algorithm:null, checksum_value:null,
-             setup_status:{state:"not_required"}}}]' <<<"$entries")"
+             installed_at:$t, source_subdir:(if $sub == "" then null else $sub end), checksum_algorithm:null, checksum_value:null,
+             setup_status:$st}}]' <<<"$entries")"
   done
   new="$(jq --argjson e "$entries" --slurpfile mp "$MANIFEST" \
     --arg mn "$MARKETPLACE_NAME" --arg url "$MARKETPLACE_URL" --arg repo "$MARKETPLACE_REPO.git" --arg t "$NOW" '
@@ -365,7 +473,7 @@ merge_plugins_json() {
     | reduce $e[] as $x (.;
         if any(.installed[]; .name == $x.entry.name) then
           (if $x.fresh then .installed |= map(if .name == $x.entry.name
-              then . + ($x.entry | {marketplace, source_url, installed_commit, latest_commit, setup_status}) else . end)
+              then . + ($x.entry | {marketplace, source_url, installed_commit, latest_commit, source_subdir, setup_status}) else . end)
            else . end)
         else .installed += [$x.entry] end)
     | reduce ($e[] | .entry.source_url | capture("^https://(?<h>[^/]+)/(?<o>[^/]+)/") | "\(.h)/\(.o)") as $h (.;
@@ -549,10 +657,16 @@ cmd_status() {
   for n in ${PLUGIN_NAMES[@]+"${PLUGIN_NAMES[@]}"}; do
     dest="$PLUGINS_DIR/$n"
     if ! exists "$dest"; then say "  $n: missing"; continue; fi
-    if owned "plugin:$n" && [ ! -L "$dest" ]; then
-      c="$(head_of "$dest")"
+    if owned "plugin:$n" && managed_dir "$n" "$dest"; then
+      c="$(plugin_commit "$n" "$dest")"
       rec="$( [ -f "$PSTATE" ] && jq -r --arg n "$n" '.installed[]? | select(.name == $n) | .installed_commit' "$PSTATE" 2>/dev/null || true)"
-      say "  $n: installed @ $(short "$c") (plugins.json: $( [ -n "$rec" ] && short "$rec" || echo none); unpinned, tracks HEAD)"
+      e="unpinned, tracks HEAD"
+      if [ -n "$(plugin_subdir "$n")" ]; then e="$(plugin_subdir "$n")/ of $(plugin_src "$n"), tracks HEAD"; fi
+      if plugin_builds "$n"; then
+        f="$(jq -r '.extension.command // empty' "$dest/.synaps-plugin/plugin.json" 2>/dev/null || true)"
+        case "$f" in */*) if [ -x "$dest/$f" ]; then e="$e; built"; else e="$e; binary $f missing"; fi ;; esac
+      fi
+      say "  $n: installed @ $(short "$c") (plugins.json: $( [ -n "$rec" ] && short "$rec" || echo none); $e)"
     else
       say "  $n: skipped (foreign)$([ -L "$dest" ] && echo " symlink → $(readlink "$dest")")"
     fi
@@ -589,19 +703,49 @@ cmd_status() {
 # ======================================================================
 # update
 # ======================================================================
+# Subdir plugins have no .git: compare the recorded commit with upstream HEAD and
+# restage the subdir if it moved. Local edits (content differs from what was
+# recorded) block the update unless --reclone.
+update_subdir_plugin() { # <name>
+  local n="$1" dest="$PLUGINS_DIR/$1" src rec rec_tree head err
+  src="$(plugin_src "$n")"
+  rec="$(state_json | jq -r --arg k "plugin:$n" '.items[$k].commit // empty')"
+  rec_tree="$(state_json | jq -r --arg k "plugin:$n" '.items[$k].tree // empty')"
+  if [ -n "$rec_tree" ] && [ "$(tree_sum "$dest")" != "$rec_tree" ]; then
+    if [ "$RECLONE" = 1 ]; then warn "$n: local changes; --reclone replaces it (old copy kept in backups)"; reclone_plugin "$n" || true
+    else skip "$n: local changes, not updating (use --reclone to replace it)"; fi
+    return 0
+  fi
+  if [ "$DRY" = 1 ]; then dry "git ls-remote $src HEAD; if it moved, copy $(plugin_subdir "$n")/ @ HEAD -> $dest (old copy to backups)"; return 0; fi
+  if ! err="$(git ls-remote "$src" HEAD 2>&1)" || [ -z "$err" ]; then
+    warn "$n: cannot reach $src: $(printf '%s' "$err" | tr '\n' ' ')"; return 0
+  fi
+  head="${err%%[[:space:]]*}"
+  if [ "$head" = "$rec" ]; then ok "$n: up to date @ $(short "$rec")"; return 0; fi
+  if reclone_plugin "$n"; then ok "$n: $(short "$rec") → $(short "$head")"; fi
+}
+
 cmd_update() {
   head1 "update plugins"
   local n dest before after err
   for n in ${PLUGIN_NAMES[@]+"${PLUGIN_NAMES[@]}"}; do
     dest="$PLUGINS_DIR/$n"
-    if ! owned "plugin:$n" || [ -L "$dest" ] || [ ! -d "$dest/.git" ]; then skip "$n: not managed by overclock"; continue; fi
+    if ! owned "plugin:$n" || ! managed_dir "$n" "$dest"; then skip "$n: not managed by overclock"; continue; fi
     OWNED_PLUGINS+=("$n")
+    if [ -n "$(plugin_subdir "$n")" ]; then update_subdir_plugin "$n"; continue; fi
+    if plugin_builds "$n" && ! have "$(plugin_needs "$n")"; then
+      skip "$n: not updating, needs '$(plugin_needs "$n")' to rebuild it$(need_hint "$(plugin_needs "$n")")"; continue
+    fi
     if is_dirty "$dest"; then
       if [ "$RECLONE" = 1 ]; then warn "$n: local changes; --reclone reclones it (old copy kept in backups)"; reclone_plugin "$n" || true
       else skip "$n: local changes, not updating (use --reclone to reclone)"; fi
       continue
     fi
-    if [ "$DRY" = 1 ]; then dry "git -C $dest fetch origin && git merge --ff-only @{upstream}"; continue; fi
+    if [ "$DRY" = 1 ]; then
+      dry "git -C $dest fetch origin && git merge --ff-only @{upstream}"
+      if plugin_builds "$n"; then dry "(cd $dest && cargo build --release --locked) if it moved; on failure reset to the old commit"; fi
+      continue
+    fi
     before="$(head_of "$dest")"
     if ! err="$(git -C "$dest" fetch -q origin 2>&1 && git -C "$dest" merge -q --ff-only '@{upstream}' 2>&1)"; then
       err="$(printf '%s' "$err" | tr '\n' ' ')"
@@ -616,6 +760,15 @@ cmd_update() {
     fi
     after="$(head_of "$dest")"
     if [ "$before" = "$after" ]; then ok "$n: up to date @ $(short "$after")"; continue; fi
+    if plugin_builds "$n"; then
+      SETUP_LOG=""
+      if ! build_plugin "$n" "$dest"; then
+        git -C "$dest" reset -q --hard "$before"
+        warn "$n: rebuild failed; source reset to $(short "$before"), the previous binary stays in place"
+        continue
+      fi
+      state_merge "plugin:$n" "$(jq -cn --argjson st "$(setup_status_json)" '{setup_status:$st}')"
+    fi
     ok "$n: $(short "$before") → $(short "$after")"
     state_merge "plugin:$n" "$(jq -n --arg c "$after" '{commit:$c}')"
     FRESH_PLUGINS+=("$n")
