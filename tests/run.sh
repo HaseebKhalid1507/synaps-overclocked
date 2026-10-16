@@ -44,7 +44,10 @@ cat >"$STUBS/cargo" <<'EOF'
 # stub cargo: records the call, fakes `cargo build` (CARGO_STUB_FAIL=1 makes it fail)
 echo "$PWD|$*" >>"$CARGO_STUB_LOG"
 if [ -n "${CARGO_STUB_FAIL:-}" ]; then echo "error[E0000]: stub build failure" >&2; exit 101; fi
-mkdir -p target/release && printf '#!/bin/sh\necho crush\n' >target/release/crush && chmod +x target/release/crush
+# like a real cargo with a user-level build.target-dir: without an explicit --target-dir the
+# binary lands in a shared dir, not ./target
+case " $* " in *" --target-dir target "*) out=target ;; *) out="$CARGO_STUB_LOG.shared-target" ;; esac
+mkdir -p "$out/release" && printf '#!/bin/sh\necho crush\n' >"$out/release/crush" && chmod +x "$out/release/crush"
 EOF
 chmod +x "$STUBS/cargo"
 with_cargo() { PATH="$STUBS:$NOCARGO" "$@"; }
@@ -672,7 +675,7 @@ offline_home
 out="$(with_cargo ocf install 2>&1)"; rc=$?
 check "exit 0" test "$rc" = 0
 check "cargo build --release --locked ran once" test "$(cat "$CARGO_STUB_LOG" | wc -l)" = 1
-check "with --locked" grep -q '|build --release --locked$' "$CARGO_STUB_LOG"
+check "with --locked and a pinned --target-dir" grep -q '|build --release --locked --target-dir target$' "$CARGO_STUB_LOG"
 check "built before the swap (in scratch, not plugins/)" bash -c "grep -q '/overclocked/.tmp\.' '$CARGO_STUB_LOG'"
 check "binary in place" test -x "$B/plugins/crush/target/release/crush"
 check "clone is pristine (target/ ignored)" test -z "$(git -C "$B/plugins/crush" status --porcelain)"

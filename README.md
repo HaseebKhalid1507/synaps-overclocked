@@ -56,7 +56,7 @@ Restart Synaps afterwards so it loads the new plugins and MCP server.
 This repo also works as a Synaps marketplace (`.synaps-plugin/marketplace.json`, absolute https sources):
 
 1. In Synaps, run `/plugins` → **add marketplace** → `https://github.com/HaseebKhalid1507/synaps-overclocked`
-2. Install `agent-comms`, `chronos`, `synaps-dash`, `heartbeat`, `d20` and `crush` from the list. crush declares a setup step (`scripts/setup.sh`, `cargo build --release --locked`), so `/plugins` builds it for you when `cargo` is on `PATH`.
+2. Install `agent-comms`, `chronos`, `synaps-dash`, `heartbeat`, `d20` and `crush` from the list. crush declares a setup step (`scripts/setup.sh`, `cargo build --release --locked --target-dir target`), so `/plugins` builds it for you when `cargo` is on `PATH`.
 3. tmux-tools lives in JR's repo, and the marketplace format only allows `./<subdir>` sources inside the marketplace's own repo. To get it through `/plugins`, add his marketplace (`https://github.com/maha-media/synaps-skills`) and install `tmux-tools` from there.
 
 That route only covers the plugins. For the agents, skills and context-mode, run `overclock`. It skips plugins that are already installed, and it adopts clean `/plugins` installs of the same source (see below).
@@ -76,7 +76,7 @@ Everything lives under `BASE="${SYNAPS_BASE_DIR:-$HOME/.synaps-cli}"`:
 | path | what |
 |---|---|
 | `plugins/{agent-comms,chronos,synaps-dash,heartbeat,d20,crush}/` | `git clone --depth=1`, same as the `/plugins` TUI |
-| `plugins/crush/target/` | `cargo build --release --locked`, run in the fresh clone before it is moved into `plugins/`, and again in place after `update` fast-forwards it |
+| `plugins/crush/target/` | `cargo build --release --locked --target-dir target`, run in the fresh clone before it is moved into `plugins/`, and again in place after `update` fast-forwards it |
 | `plugins/tmux-tools/` | the `tmux-tools-plugin/` dir of `maha-media/synaps-skills` at HEAD, copied the way `/plugins` installs a `./<subdir>` plugin (`install_plugin_from_subdir`): no `.git`, nothing else from the repo. overclock fetches it with a shallow, sparse checkout |
 | `plugins.json` | jq merge: adds the `synaps-overclocked` marketplace, one `installed` entry per plugin, and the trusted hosts `github.com/HaseebKhalid1507` and `github.com/maha-media`. Each entry gets `installed_commit` (`git rev-parse HEAD`, or the fetched repo commit for tmux-tools) and `setup_status`: `not_required`, or `succeeded` with `log_path` for crush. tmux-tools also gets `source_url` = the synaps-skills repo and `source_subdir: "tmux-tools-plugin"`. Existing keys and entries are preserved. |
 | `agents/<name>.md` | copied from `agents/` |
@@ -105,7 +105,7 @@ Safety rules:
 - A `context-mode` MCP entry that points somewhere else is left alone unless `--replace-foreign` is given. In that case the old entry is recorded and `uninstall` restores it.
 - Rewritten `plugins.json`/`mcp.json` keep their file mode. New files are created `0600`.
 - Recorded paths must sit under `BASE` with no `.`/`..` components. `SYNAPS_BASE_DIR` itself may not contain them either.
-- **crush** is the only thing overclock builds. It runs `cargo build --release --locked` (never an unlocked build, and never without a `Cargo.lock`) and then checks that the manifest's `extension.command` (`target/release/crush`) exists and is executable. Without `cargo`, crush is skipped with a warning and not registered. If the build fails on install, nothing is moved into `plugins/` or registered (a foreign dir that `--replace-foreign` would have replaced stays where it is). If the rebuild fails on `update`, the clone is reset to the commit it was at and the previous binary stays.
+- **crush** is the only thing overclock builds. It runs `cargo build --release --locked --target-dir target` (never an unlocked build, and never without a `Cargo.lock`) and then checks that the manifest's `extension.command` (`target/release/crush`) exists and is executable. Without `cargo`, crush is skipped with a warning and not registered. If the build fails on install, nothing is moved into `plugins/` or registered (a foreign dir that `--replace-foreign` would have replaced stays where it is). If the rebuild fails on `update`, the clone is reset to the commit it was at and the previous binary stays.
 - `update` and tmux-tools: overclock compares the recorded commit with `git ls-remote` HEAD and copies the subdir again if HEAD moved; the old copy goes to backups. If you edited files in it, the update is skipped, unless you pass `--reclone`.
 - Refuses to run as root. Never runs npm/bun installs.
 

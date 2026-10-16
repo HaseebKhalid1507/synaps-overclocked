@@ -321,7 +321,9 @@ stage_subdir() { # <src> <subdir> <ref> <work>
   mv "$4/src/$2" "$4/out"
 }
 
-# crush: cargo build --release --locked, then the manifest's command must exist.
+# crush: cargo build --release --locked --target-dir target, then the manifest's command must exist.
+# --target-dir is pinned: a user-level build.target-dir / CARGO_TARGET_DIR would otherwise put the
+# binary somewhere the manifest's plugin-relative command can't find it.
 # Log goes to $OC_DIR/logs/; the path is recorded as setup_status like /plugins does.
 SETUP_LOG=""
 build_plugin() { # <name> <plugin dir>
@@ -329,8 +331,8 @@ build_plugin() { # <name> <plugin dir>
   if [ ! -f "$d/Cargo.lock" ]; then warn "$n: no Cargo.lock in the source; refusing an unlocked build"; return 1; fi
   mkdir -p "$OC_DIR/logs"
   log="$OC_DIR/logs/$n-$TS.log"
-  say "  … $n: cargo build --release --locked (log: $log)"
-  if ! (cd "$d" && cargo build --release --locked) >"$log" 2>&1; then
+  say "  … $n: cargo build --release --locked --target-dir target (log: $log)"
+  if ! (cd "$d" && cargo build --release --locked --target-dir target) >"$log" 2>&1; then
     warn "$n: cargo build failed: $(tail -n 3 "$log" | tr '\n' ' ')"
     warn "  full log: $log"
     return 1
@@ -358,7 +360,7 @@ reclone_plugin() { # <name> [foreign]
     if exists "$dest"; then if [ -n "$foreign" ]; then displace "$dest"; else move_aside "$dest"; fi; fi
     if [ -n "$sub" ]; then dry "sparse clone --depth=1 $src, copy $sub/ -> $dest"
     else dry "git clone --depth=1 $src $dest"; fi
-    if plugin_builds "$n"; then dry "(cd $dest && cargo build --release --locked)"; fi
+    if plugin_builds "$n"; then dry "(cd $dest && cargo build --release --locked --target-dir target)"; fi
     dry "record $n in $PSTATE (marketplace $MARKETPLACE_NAME${sub:+, source_subdir $sub})"
     return 0
   fi
@@ -743,7 +745,7 @@ cmd_update() {
     fi
     if [ "$DRY" = 1 ]; then
       dry "git -C $dest fetch origin && git merge --ff-only @{upstream}"
-      if plugin_builds "$n"; then dry "(cd $dest && cargo build --release --locked) if it moved; on failure reset to the old commit"; fi
+      if plugin_builds "$n"; then dry "(cd $dest && cargo build --release --locked --target-dir target) if it moved; on failure reset to the old commit"; fi
       continue
     fi
     before="$(head_of "$dest")"
