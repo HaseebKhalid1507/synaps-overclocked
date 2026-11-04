@@ -1,7 +1,7 @@
 {
   "name": "synaps-overclocked",
-  "version": "1.1.0",
-  "description": "Haseeb's Synaps plugin stack: session awareness, time injection, the browser dashboard, prompt-cache keepalive, a d20 and a tool-output compressor.",
+  "version": "1.2.0",
+  "description": "Haseeb's Synaps plugin stack: session awareness, time injection, the browser dashboard, prompt-cache keepalive, a d20, a tool-output compressor and keyless web search/fetch.",
   "trust": {
     "publisher": "Haseeb Khalid",
     "homepage": "https://github.com/HaseebKhalid1507/synaps-overclocked"
@@ -47,6 +47,13 @@
       "source": "https://github.com/HaseebKhalid1507/Crush-Synaps.git",
       "version": "0.1.0",
       "description": "Native Rust tool-output compressor (after_tool_call). Built on install with cargo (needs a Rust toolchain).",
+      "license": "MIT"
+    },
+    {
+      "name": "web-tools",
+      "source": "https://github.com/HaseebKhalid1507/synaps-web-tools.git",
+      "version": "1.4.0",
+      "description": "Keyless web search (DuckDuckGo HTML, Bing RSS fallback) and page fetch to readable text. Python stdlib only, no npm.",
       "license": "MIT"
     }
   ]

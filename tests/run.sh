@@ -306,6 +306,7 @@ mk_upstream heartbeat python3
 printf 'config\n' >"$UP/heartbeat-work/.gitignore"   # user settings stay untracked (see its README)
 git -C "$UP/heartbeat-work" add -A; git -C "$UP/heartbeat-work" commit -qm gitignore; git -C "$UP/heartbeat-work" push -q origin main
 mk_upstream d20 python3
+mk_upstream web-tools python3
 mk_upstream crush target/release/crush   # Rust plugin: built by `cargo build --release --locked`
 printf 'target/\n' >"$UP/crush-work/.gitignore"; echo '[package]' >"$UP/crush-work/Cargo.toml"; echo '# lock' >"$UP/crush-work/Cargo.lock"
 git -C "$UP/crush-work" add -A; git -C "$UP/crush-work" commit -qm cargo; git -C "$UP/crush-work" push -q origin main
@@ -327,7 +328,7 @@ push_sub() { # <file under the repo> <line>
   echo "$2" >>"$UP/skills-repo-work/$1"; git -C "$UP/skills-repo-work" add -A
   git -C "$UP/skills-repo-work" commit -qm "$2"; git -C "$UP/skills-repo-work" push -q origin main
 }
-LIVE_OFFLINE="agent-comms chronos d20 heartbeat synaps-dash tmux-tools "   # crush needs cargo; PATH has none
+LIVE_OFFLINE="agent-comms chronos d20 heartbeat synaps-dash tmux-tools web-tools "   # crush needs cargo; PATH has none
 FORK="$(tmpd)"
 cp -R "$REPO/." "$FORK/"; rm -rf "$FORK/.git"
 jq --arg u "$UP" '.plugins |= map(.source = "file://\($u)/\(.name).git")' "$REPO/.synaps-plugin/marketplace.json" >"$FORK/.synaps-plugin/marketplace.json"
@@ -410,7 +411,7 @@ start "--profile / SYNAPS_PROFILE"
 offline_home
 out="$(SYNAPS_PROFILE=work ocf install 2>&1)"; rc=$?
 check "exit 0" test "$rc" = 0
-check "plugins.json written to profile dir" jq -e '[.installed[].name] | sort == ["agent-comms","chronos","d20","heartbeat","synaps-dash","tmux-tools"]' "$B/work/plugins.json"
+check "plugins.json written to profile dir" jq -e '[.installed[].name] | sort == ["agent-comms","chronos","d20","heartbeat","synaps-dash","tmux-tools","web-tools"]' "$B/work/plugins.json"
 check "no base plugins.json" test ! -e "$B/plugins.json"
 check "plugins still in base plugins/" test -d "$B/plugins/chronos/.git"
 check "--profile flag sees the same state" grep -q "chronos: installed @ .* (plugins.json: [0-9a-f]\{7\};" <<<"$(ocf status --profile work)"
@@ -560,6 +561,29 @@ check "uninstall exit 0" test "$rc" = 0
 check "heartbeat and d20 moved out" test ! -e "$B/plugins/heartbeat" -a ! -e "$B/plugins/d20"
 check "their entries are gone" jq -e 'all(.installed[]; .name != "heartbeat" and .name != "d20")' "$B/plugins.json"
 check "removed/ holds heartbeat with its config" test -f "$(ls -d "$B"/overclocked/removed/*/plugins/heartbeat | head -n1)/config"
+
+# ======================================================================
+start "web-tools: installed like the others; a hand-made plugins/web-tools is foreign"
+offline_home
+out="$(ocf install 2>&1)"; rc=$?
+check "exit 0" test "$rc" = 0
+check "web-tools cloned" test "$(git -C "$B/plugins/web-tools" rev-parse HEAD)" = "$(up_head web-tools)"
+check "web-tools plugins.json entry" jq -e --arg u "file://$UP/web-tools.git" '.installed[] | select(.name == "web-tools") | .source_url == $u and .marketplace == "synaps-overclocked" and .source_subdir == null and .setup_status == {state:"not_required"}' "$B/plugins.json"
+check "no npm install" test ! -e "$B/plugins/web-tools/node_modules"
+offline_home
+W="$B/plugins/web-tools"   # a local bridge dir: no .git, not recorded by overclock
+mkdir -p "$W/.synaps-plugin"; echo '{"name":"web-tools","version":"1.3.1"}' >"$W/.synaps-plugin/plugin.json"; echo bridge >"$W/main.py"
+before="$(tree_hash "$W")"
+out="$(ocf install 2>&1)"; rc=$?
+check "exit 0 with a foreign web-tools" test "$rc" = 0
+check "foreign web-tools skipped" grep -qF "web-tools: skipped, $W exists and is not managed by overclock (use --replace-foreign to replace it)" <<<"$out"
+check "foreign web-tools untouched" test "$before" = "$(tree_hash "$W")"
+check "no plugins.json entry for it" jq -e 'all(.installed[]; .name != "web-tools")' "$B/plugins.json"
+check "the rest installed" jq -e 'any(.installed[]; .name == "d20")' "$B/plugins.json"
+check "status: foreign" grep -q "web-tools: skipped (foreign)" <<<"$(ocf status)"
+out="$(ocf install --dry-run --replace-foreign 2>&1)"
+check "--replace-foreign would move it aside" grep -q "\[dry-run\] mv $W -> $B/overclocked/backups/[0-9]*/plugins/web-tools" <<<"$out"
+check "dry-run left it alone" test "$before" = "$(tree_hash "$W")"
 
 # ======================================================================
 start "subdir plugin (tmux-tools): install like /plugins"

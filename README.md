@@ -12,6 +12,7 @@ Our plugin stack in a box. One command turns stock SynapsCLI into Synaps the way
 | plugin | `heartbeat`: keeps the Anthropic prompt cache warm through idle gaps with a tiny keepalive turn before the 5-minute TTL | [synaps-heartbeat](https://github.com/HaseebKhalid1507/synaps-heartbeat) (tracks HEAD) | `python3` |
 | plugin | `d20`: rolls a d20 before every user message and injects it | [synaps-d20](https://github.com/HaseebKhalid1507/synaps-d20) (tracks HEAD) | `python3` |
 | plugin | `crush`: native Rust compressor for tool output (`after_tool_call`) | [Crush-Synaps](https://github.com/HaseebKhalid1507/Crush-Synaps) (tracks HEAD, built on install) | `cargo` |
+| plugin | `web-tools`: `search` and `fetch` tools. Keyless (DuckDuckGo HTML, Bing RSS as last resort), Python stdlib only, no npm. `fetch` uses JR's `fetch.js` when node and its `node_modules` are already there, and otherwise a built-in extractor | [synaps-web-tools](https://github.com/HaseebKhalid1507/synaps-web-tools) (tracks HEAD) | `python3` |
 | plugin | `tmux-tools`: worker-pane skills for agents running inside tmux | `tmux-tools-plugin/` in [maha-media/synaps-skills](https://github.com/maha-media/synaps-skills) by JR Morton (tracks HEAD, MIT) | – (`tmux` at runtime) |
 | agents | spike, shady, chrollo, case, silverhand, yoru, joestar, gojo, starlord, okarin, zero, ryuga, 007, saul | `agents/` in this repo | – |
 | skill | `gauntlet-loop` | [robonuggets/gauntlet-loop](https://github.com/robonuggets/gauntlet-loop) @ `9b1975a` (CC BY 4.0, technique by Matt Shumer) | – |
@@ -56,7 +57,7 @@ Restart Synaps afterwards so it loads the new plugins and MCP server.
 This repo also works as a Synaps marketplace (`.synaps-plugin/marketplace.json`, absolute https sources):
 
 1. In Synaps, run `/plugins` → **add marketplace** → `https://github.com/HaseebKhalid1507/synaps-overclocked`
-2. Install `agent-comms`, `chronos`, `synaps-dash`, `heartbeat`, `d20` and `crush` from the list. crush declares a setup step (`scripts/setup.sh`, `cargo build --release --locked --target-dir target`), so `/plugins` builds it for you when `cargo` is on `PATH`.
+2. Install `agent-comms`, `chronos`, `synaps-dash`, `heartbeat`, `d20`, `crush` and `web-tools` from the list. crush declares a setup step (`scripts/setup.sh`, `cargo build --release --locked --target-dir target`), so `/plugins` builds it for you when `cargo` is on `PATH`.
 3. tmux-tools lives in JR's repo, and the marketplace format only allows `./<subdir>` sources inside the marketplace's own repo. To get it through `/plugins`, add his marketplace (`https://github.com/maha-media/synaps-skills`) and install `tmux-tools` from there.
 
 That route only covers the plugins. For the agents, skills and context-mode, run `overclock`. It skips plugins that are already installed, and it adopts clean `/plugins` installs of the same source (see below).
@@ -75,7 +76,7 @@ Everything lives under `BASE="${SYNAPS_BASE_DIR:-$HOME/.synaps-cli}"`:
 
 | path | what |
 |---|---|
-| `plugins/{agent-comms,chronos,synaps-dash,heartbeat,d20,crush}/` | `git clone --depth=1`, same as the `/plugins` TUI |
+| `plugins/{agent-comms,chronos,synaps-dash,heartbeat,d20,crush,web-tools}/` | `git clone --depth=1`, same as the `/plugins` TUI |
 | `plugins/crush/target/` | `cargo build --release --locked --target-dir target`, run in the fresh clone before it is moved into `plugins/`, and again in place after `update` fast-forwards it |
 | `plugins/tmux-tools/` | the `tmux-tools-plugin/` dir of `maha-media/synaps-skills` at HEAD, copied the way `/plugins` installs a `./<subdir>` plugin (`install_plugin_from_subdir`): no `.git`, nothing else from the repo. overclock fetches it with a shallow, sparse checkout |
 | `plugins.json` | jq merge: adds the `synaps-overclocked` marketplace, one `installed` entry per plugin, and the trusted hosts `github.com/HaseebKhalid1507` and `github.com/maha-media`. Each entry gets `installed_commit` (`git rev-parse HEAD`, or the fetched repo commit for tmux-tools) and `setup_status`: `not_required`, or `succeeded` with `log_path` for crush. tmux-tools also gets `source_url` = the synaps-skills repo and `source_subdir: "tmux-tools-plugin"`. Existing keys and entries are preserved. |
@@ -98,7 +99,7 @@ Safety rules:
   - its `origin` is the same repo (ignoring `.git`, a trailing `/` and case)
   - it is clean: `git status --porcelain` is empty, and it has no commits ahead of `@{upstream}`
 
-  A dev clone with local work is treated as foreign.
+  A dev clone with local work is treated as foreign. So is a hand-made `plugins/web-tools/` that isn't a clone of synaps-web-tools, such as the old local bridge: it is skipped and reported, and stays in use until you pass `--replace-foreign`.
 
   tmux-tools has no `.git`, so it's adopted when `plugins.json` already has a `tmux-tools` entry with the same `source_url` and `source_subdir`, and the dir's content matches that subdir at the entry's `installed_commit` exactly. Anything else is foreign.
 - Before `plugins.json` or `mcp.json` is rewritten, it is copied into the backups dir. Writes are atomic (temp file + rename). If either file is invalid JSON or the wrong shape, overclock aborts before writing anything. If either one is a symlink, overclock warns and leaves it alone, because a rename would replace the link.
@@ -141,7 +142,7 @@ Delete `BASE/overclocked/removed/` yourself once you're sure.
 tests/run.sh
 ```
 
-Every case runs with a throwaway `HOME` and `SYNAPS_BASE_DIR`. The suite refuses to start if the base dir resolves to anything under your real home. It never runs a real `cargo`: `PATH` is rebuilt without it, and the crush cases put a stub `cargo` in front that fakes a successful or failing build. The full-install cases need network access, because they clone from GitHub. The update, force-push, adoption, profile, uninstall, heartbeat/d20, tmux-tools and crush cases use local `file://` repos.
+Every case runs with a throwaway `HOME` and `SYNAPS_BASE_DIR`. The suite refuses to start if the base dir resolves to anything under your real home. It never runs a real `cargo`: `PATH` is rebuilt without it, and the crush cases put a stub `cargo` in front that fakes a successful or failing build. The full-install cases need network access, because they clone from GitHub. The update, force-push, adoption, profile, uninstall, heartbeat/d20, web-tools, tmux-tools and crush cases use local `file://` repos.
 
 ## Tested on
 
